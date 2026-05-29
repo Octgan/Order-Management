@@ -129,6 +129,32 @@ class DaySummary:
 SUMMARY_CUSTOMER_ROW_KEYWORDS = ["取引", "transaction", "客数", "注文件数", "件数"]
 SUMMARY_SALES_ROW_KEYWORDS = ["売上", "sales", "gross", "net", "収入", "合計金額"]
 
+# Square「商品売上サマリー」の商品名 → アプリ登録名（長いパターンを先に評価）
+PRODUCT_NAME_ALIASES: dict[str, list[str]] = {
+    "パフェ": ["ワッフル パフェ", "ワッフル　パフェ"],
+    "ワッフル": ["リエージュワッフル"],
+    "抹茶チーズケーキ": ["抹茶チーズケーキ"],
+    "チーズケーキ": ["トンカチーズケーキ"],
+    "バナナパウンドケーキ": ["バナナパウンドケーキ"],
+    "レモンパウンドケーキ": ["レモンポピーシード パウンドケーキ", "レモンパウンドケーキ"],
+    "季節のソースとグラノーラ": [
+        "オリジナルグラノーラ＋ヨーグルトと季節のジャム",
+        "オリジナルグラノーラ+ヨーグルトと季節のジャム",
+    ],
+    "グラノーラ": ["オリジナルグラノーラ＋ミルク", "オリジナルグラノーラ+ミルク"],
+    "オーバーナイトグラノーラ": ["オーバーナイト オーツ", "オーバーナイトオーツ"],
+}
+
+KV_CUSTOMER_METRIC_LABELS = ["売上取引履歴", "総売上取引履歴", "受取合計額の取引履歴"]
+KV_SALES_METRIC_LABELS = ["純売上高", "総売上高", "売上合計", "受取合計額", "正味売上"]
+KV_SUMMARY_LABEL_HINTS = KV_CUSTOMER_METRIC_LABELS + KV_SALES_METRIC_LABELS + [
+    "総売上",
+    "純売上",
+    "取引履歴",
+    "ギフトカード",
+    "税金",
+]
+
 
 # ---------------------------------------------------------------------------
 # UI
@@ -296,6 +322,151 @@ def is_summary_row_label(name: str) -> bool:
     return any(k in label for k in SKIP_ROW_KEYWORDS)
 
 
+def decode_uploaded_bytes(raw: bytes) -> str:
+    for enc in ("utf-8-sig", "utf-8", "utf-16", "utf-16-le", "cp932", "shift_jis"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def detect_csv_separator(text: str) -> str:
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if line.count("\t") >= line.count(","):
+            return "\t"
+        return ","
+    return ","
+
+
+def parse_yen_to_int(val: Any) -> int:
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none", "-", "—"):
+        return 0
+    negative = "(" in s or s.startswith("-")
+    s = re.sub(r"[￥¥,\s\"']", "", s)
+    s = s.replace("(", "").replace(")", "")
+    if not s:
+        return 0
+    try:
+        num = int(float(s))
+    except ValueError:
+        return 0
+    return -num if negative else num
+
+
+def parse_count_metric(val: Any) -> int:
+    s = str(val).strip().replace(",", "").replace('"', "")
+    digits = re.sub(r"[^\d]", "", s)
+    return int(digits) if digits else 0
+
+
+def cell_value_is_yen(val: Any) -> bool:
+    s = str(val).strip()
+    return "￥" in s or "¥" in s or ("(" in s and ")" in s and re.search(r"\d", s))
+
+
+def parse_matrix_cell(val: Any) -> tuple[int, bool]:
+    """(数値, 金額表記か) — 金額の場合は円単位の整数。"""
+    if cell_value_is_yen(val):
+        return parse_yen_to_int(val), True
+    num = int(pd.to_numeric(val, errors="coerce") or 0)
+    return num, False
+
+
+def normalize_square_kv_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Square sales-summary を metric / value の2列に正規化。"""
+    if df.empty:
+        return df
+    if "metric" in df.columns and "value" in df.columns:
+        return df
+    if df.shape[1] < 2:
+        return df
+    return pd.DataFrame(
+        {
+            "metric": df.iloc[:, 0].astype(str).str.strip(),
+            "value": df.iloc[:, 1],
+        }
+    )
+
+
+def read_square_sales_summary_csv(uploaded_file: Any) -> pd.DataFrame:
+    """Square sales-summary（先頭メタ行付き・2列CSV）を読み込む。"""
+    text = decode_uploaded_bytes(uploaded_file.getvalue())
+    df = pd.read_csv(io.StringIO(text))
+    return normalize_square_kv_dataframe(df)
+
+
+def kv_metric_series(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    if "metric" in df.columns:
+        return df["metric"].astype(str).str.strip(), df["value"]
+    return df.iloc[:, 0].astype(str).str.strip(), df.iloc[:, 1]
+
+
+def is_square_kv_summary_df(df: pd.DataFrame) -> bool:
+    """Square sales-summary（指標名×値の2列・期間集計）。"""
+    if df.empty or df.shape[1] < 2:
+        return False
+    cols = [str(c) for c in df.columns]
+    if get_matrix_date_columns(cols):
+        return False
+    labels, _values = kv_metric_series(df)
+    hits = sum(1 for lab in labels if any(h in lab for h in KV_SUMMARY_LABEL_HINTS))
+    return hits >= 2
+
+
+def extract_period_summary_from_kv(df: pd.DataFrame) -> tuple[int, int]:
+    """期間合計の (総客数=取引件数, 店舗総売上)。"""
+    df = normalize_square_kv_dataframe(df)
+    labels, values = kv_metric_series(df)
+    metric_map = dict(zip(labels, values))
+
+    customers = 0
+    for key in KV_CUSTOMER_METRIC_LABELS:
+        if key in metric_map:
+            customers = parse_count_metric(metric_map[key])
+            break
+
+    sales = 0
+    for key in KV_SALES_METRIC_LABELS:
+        if key in metric_map:
+            sales = parse_yen_to_int(metric_map[key])
+            break
+
+    if customers == 0 and sales == 0:
+        raise ValueError("売上サマリーCSVから期間合計（取引件数・売上）を抽出できませんでした。")
+    return customers, sales
+
+
+def distribute_period_summary_to_days(
+    period_customers: int,
+    period_sales: int,
+    daily_weights: dict[date, float],
+) -> dict[date, DaySummary]:
+    if not daily_weights:
+        raise ValueError("商品別CSVの日付が無いため、期間サマリーを日別に配分できません。")
+    total_w = sum(daily_weights.values()) or 1.0
+    by_day: dict[date, DaySummary] = {}
+    allocated_sales = 0
+    allocated_customers = 0
+    days_sorted = sorted(daily_weights.keys())
+    for i, day_val in enumerate(days_sorted):
+        w = daily_weights[day_val]
+        if i == len(days_sorted) - 1:
+            day_sales = period_sales - allocated_sales
+            day_customers = period_customers - allocated_customers
+        else:
+            ratio = w / total_w
+            day_sales = int(period_sales * ratio)
+            day_customers = int(period_customers * ratio)
+            allocated_sales += day_sales
+            allocated_customers += day_customers
+        by_day[day_val] = DaySummary(total_sales=max(0, day_sales), total_customers=max(0, day_customers))
+    return by_day
+
+
 def matrix_to_long_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """マトリックス形式 → 縦持ち（日付, 商品名, 数量）へ変換。"""
     cols = [str(c) for c in df.columns]
@@ -309,10 +480,12 @@ def matrix_to_long_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     long_df["date"] = long_df["_date_col"].apply(lambda x: parse_column_as_date(str(x)))
     long_df = long_df.dropna(subset=["date"])
     long_df["product_name"] = long_df[item_col].astype(str).str.strip()
-    long_df["quantity"] = pd.to_numeric(long_df["quantity"], errors="coerce").fillna(0).astype(int)
+    parsed = long_df["quantity"].apply(parse_matrix_cell)
+    long_df["quantity"] = parsed.apply(lambda x: x[0])
+    long_df["is_revenue"] = parsed.apply(lambda x: x[1])
     long_df = long_df[long_df["product_name"].astype(str).str.len() > 0]
     long_df = long_df[~long_df["product_name"].apply(is_summary_row_label)]
-    return long_df[["date", "product_name", "quantity"]]
+    return long_df[["date", "product_name", "quantity", "is_revenue"]]
 
 
 def is_customer_metric_label(label: str) -> bool:
@@ -335,9 +508,9 @@ def is_sales_metric_label(label: str) -> bool:
 
 def parse_matrix_units_by_day(
     df: pd.DataFrame, products_df: pd.DataFrame
-) -> tuple[dict[date, dict[str, int]], list[str]]:
-    """商品別マトリックスCSVから日別・商品別販売数のみ抽出。"""
-    warnings: list[str] = ["商品別マトリックスCSVを読み込みました。"]
+) -> tuple[dict[date, dict[str, int]], dict[date, float], list[str]]:
+    """商品別マトリックスCSVから日別・商品別販売数と日別売上ウェイトを抽出。"""
+    warnings: list[str] = ["商品別マトリックスCSV（Square商品売上サマリー）を読み込みました。"]
     prepared = prepare_square_dataframe(df)
     if not is_matrix_format_df(prepared):
         raise ValueError("商品別CSVはマトリックス形式（日付が横方向）である必要があります。")
@@ -347,23 +520,40 @@ def parse_matrix_units_by_day(
         raise ValueError("商品別マトリックスCSVから販売データを抽出できませんでした。")
 
     product_names = products_df["name"].astype(str).tolist()
+    price_map = dict(zip(products_df["name"], products_df["unit_price"]))
     units_by_day: dict[date, dict[str, int]] = {}
+    revenue_by_day: dict[date, float] = {}
+    used_yen = False
 
     for day_val, day_group in long_df.groupby("date"):
         units = {name: 0 for name in product_names}
+        day_revenue = 0.0
         unmapped: list[str] = []
         for _, row in day_group.iterrows():
             matched = match_product_name(row["product_name"], product_names)
             if not matched:
                 unmapped.append(str(row["product_name"]))
                 continue
-            units[matched] = units.get(matched, 0) + int(row["quantity"])
+            raw = int(row["quantity"])
+            unit_price = int(price_map.get(matched, 0) or 0)
+            if bool(row.get("is_revenue", False)):
+                used_yen = True
+                day_revenue += raw
+                add_units = max(0, round(raw / unit_price)) if unit_price > 0 else 0
+            else:
+                add_units = raw
+                day_revenue += raw * unit_price
+            units[matched] = units.get(matched, 0) + add_units
         if unmapped:
             sample = ", ".join(sorted(set(unmapped))[:5])
             warnings.append(f"{day_val}: 未登録商品をスキップ（例: {sample}）")
         units_by_day[day_val] = units
+        revenue_by_day[day_val] = max(day_revenue, 1.0) if sum(units.values()) > 0 else 0.0
 
-    return units_by_day, warnings
+    if used_yen:
+        warnings.append("セルが金額（¥）表記のため、登録単価から販売数を換算しました。")
+
+    return units_by_day, revenue_by_day, warnings
 
 
 def parse_sales_summary_vertical(df: pd.DataFrame) -> tuple[dict[date, DaySummary], list[str]]:
@@ -439,7 +629,30 @@ def parse_sales_summary_matrix(df: pd.DataFrame) -> tuple[dict[date, DaySummary]
     return by_day, warnings
 
 
-def parse_sales_summary_csv(df: pd.DataFrame) -> tuple[dict[date, DaySummary], list[str]]:
+def parse_sales_summary_kv(
+    df: pd.DataFrame, daily_weights: dict[date, float]
+) -> tuple[dict[date, DaySummary], list[str]]:
+    """Square sales-summary（期間集計・2列）を商品別日次ウェイトで日別配分。"""
+    warnings: list[str] = [
+        "売上サマリーCSV（Square期間集計形式）を読み込み、商品別売上の日次比率で客数・総売上を配分しました。",
+    ]
+    period_customers, period_sales = extract_period_summary_from_kv(df)
+    by_day = distribute_period_summary_to_days(period_customers, period_sales, daily_weights)
+    return by_day, warnings
+
+
+def parse_sales_summary_csv(
+    df: pd.DataFrame,
+    daily_weights: dict[date, float] | None = None,
+) -> tuple[dict[date, DaySummary], list[str]]:
+    df = normalize_square_kv_dataframe(df)
+    if is_square_kv_summary_df(df):
+        if not daily_weights:
+            raise ValueError(
+                "売上サマリーは期間合計形式です。商品売上サマリーCSVと一緒にアップロードしてください。"
+            )
+        return parse_sales_summary_kv(df, daily_weights)
+
     prepared = prepare_square_dataframe(df)
     if is_matrix_format_df(prepared):
         item_col = find_matrix_item_column([str(c) for c in prepared.columns])
@@ -453,10 +666,22 @@ def parse_sales_summary_csv(df: pd.DataFrame) -> tuple[dict[date, DaySummary], l
     return parse_sales_summary_vertical(prepared)
 
 
-def classify_uploaded_csv(df: pd.DataFrame, products_df: pd.DataFrame) -> str:
+def classify_uploaded_csv(
+    df: pd.DataFrame, products_df: pd.DataFrame, filename: str = ""
+) -> str:
     """product_matrix / sales_summary / unknown"""
+    name_lower = (filename or "").lower()
+    if "sales-summary" in name_lower or ("売上サマリー" in name_lower and "商品" not in name_lower):
+        return "sales_summary"
+
+    if is_square_kv_summary_df(df):
+        return "sales_summary"
+
     prepared = prepare_square_dataframe(df)
     product_names = products_df["name"].astype(str).tolist()
+
+    if "商品売上" in name_lower and is_matrix_format_df(prepared):
+        return "product_matrix"
 
     if is_matrix_format_df(prepared):
         item_col = find_matrix_item_column([str(c) for c in prepared.columns])
@@ -476,6 +701,9 @@ def classify_uploaded_csv(df: pd.DataFrame, products_df: pd.DataFrame) -> str:
             return "product_matrix"
         if metric_rows > 0:
             return "sales_summary"
+        matrix_cols = [str(c) for c in prepared.columns]
+        if "商品売上" in name_lower or find_column(matrix_cols, ["商品名"]):
+            return "product_matrix"
         return "product_matrix"
 
     cols = [str(c) for c in prepared.columns]
@@ -539,6 +767,20 @@ def merge_dual_csv_imports(
     return imports, warnings
 
 
+def load_uploaded_dataframe(uploaded_file: Any, products_df: pd.DataFrame) -> tuple[str, pd.DataFrame]:
+    """ファイル名と内容から種別を判定し、適切に読み込む。"""
+    name = getattr(uploaded_file, "name", "") or ""
+    name_lower = name.lower()
+    raw = uploaded_file.getvalue()
+
+    if "sales-summary" in name_lower or ("売上サマリー" in name and "商品" not in name):
+        df = read_square_sales_summary_csv(uploaded_file)
+        return classify_uploaded_csv(df, products_df, name), df
+
+    df = read_uploaded_csv(uploaded_file)
+    return classify_uploaded_csv(df, products_df, name), df
+
+
 def parse_dual_csv_upload(
     uploaded_files: list[Any], products_df: pd.DataFrame
 ) -> tuple[list[DayImport], list[str]]:
@@ -546,34 +788,33 @@ def parse_dual_csv_upload(
     if len(uploaded_files) > 2:
         raise ValueError("アップロードは2ファイルまでです。")
 
-    classified: list[tuple[str, Any, pd.DataFrame, str]] = []
+    classified: list[tuple[str, pd.DataFrame, str]] = []
     for f in uploaded_files:
-        df = read_uploaded_csv(f)
-        kind = classify_uploaded_csv(df, products_df)
-        classified.append((f.name, f, df, kind))
+        kind, df = load_uploaded_dataframe(f, products_df)
+        classified.append((f.name, df, kind))
 
     if len(classified) == 1:
-        return parse_square_csv(classified[0][2], products_df)
+        return parse_square_csv(classified[0][1], products_df)
 
-    product_file = next((x for x in classified if x[3] == "product_matrix"), None)
-    summary_file = next((x for x in classified if x[3] == "sales_summary"), None)
+    product_file = next((x for x in classified if x[2] == "product_matrix"), None)
+    summary_file = next((x for x in classified if x[2] == "sales_summary"), None)
 
     if not product_file or not summary_file:
-        kinds = ", ".join(f"{x[0]}→{x[3]}" for x in classified)
+        kinds = ", ".join(f"{x[0]}→{x[2]}" for x in classified)
         raise ValueError(
-            "2枚の内訳を認識できませんでした。商品別マトリックスCSVと売上サマリーCSVをアップロードしてください。"
+            "2枚の内訳を認識できませんでした。商品売上サマリーCSVと売上サマリーCSVをアップロードしてください。"
             f"（判定: {kinds}）"
         )
 
-    units_by_day, w1 = parse_matrix_units_by_day(product_file[2], products_df)
-    summary_by_day, w2 = parse_sales_summary_csv(summary_file[2])
+    units_by_day, revenue_by_day, w1 = parse_matrix_units_by_day(product_file[1], products_df)
+    summary_by_day, w2 = parse_sales_summary_csv(summary_file[1], daily_weights=revenue_by_day)
     imports, w3 = merge_dual_csv_imports(units_by_day, summary_by_day, products_df)
     return imports, w1 + w2 + w3
 
 
 def parse_matrix_format(df: pd.DataFrame, products_df: pd.DataFrame) -> tuple[list[DayImport], list[str]]:
     """横持ちマトリックス（日付=列、商品=行）を日次データへ変換（単体アップロード用）。"""
-    units_by_day, warnings = parse_matrix_units_by_day(df, products_df)
+    units_by_day, _revenue_by_day, warnings = parse_matrix_units_by_day(df, products_df)
     price_map = dict(zip(products_df["name"], products_df["unit_price"]))
     product_names = products_df["name"].astype(str).tolist()
     imports: list[DayImport] = []
@@ -641,29 +882,18 @@ def show_csv_debug_panel(raw_df: pd.DataFrame, mapping: dict[str, str | None] | 
 
 def read_uploaded_csv(uploaded_file: Any) -> pd.DataFrame:
     raw = uploaded_file.getvalue()
-    read_kwargs: dict[str, Any] = {"on_bad_lines": "skip"}
-    for enc in ("utf-8-sig", "utf-8", "cp932", "shift_jis"):
-        try:
-            df = pd.read_csv(io.BytesIO(raw), encoding=enc, **read_kwargs)
-            return prepare_square_dataframe(df)
-        except UnicodeDecodeError:
-            continue
-    text = raw.decode("utf-8", errors="replace")
-    df = pd.read_csv(io.StringIO(text), **read_kwargs)
+    text = decode_uploaded_bytes(raw)
+    sep = detect_csv_separator(text)
+    df = pd.read_csv(io.StringIO(text), sep=sep, on_bad_lines="skip")
     return prepare_square_dataframe(df)
 
 
 def read_uploaded_csv_raw(uploaded_file: Any) -> pd.DataFrame:
     """ヘッダー自動検出前の生データ（デバッグ表示用）。"""
     raw = uploaded_file.getvalue()
-    read_kwargs: dict[str, Any] = {"on_bad_lines": "skip"}
-    for enc in ("utf-8-sig", "utf-8", "cp932", "shift_jis"):
-        try:
-            return pd.read_csv(io.BytesIO(raw), encoding=enc, header=None, **read_kwargs)
-        except UnicodeDecodeError:
-            continue
-    text = raw.decode("utf-8", errors="replace")
-    return pd.read_csv(io.StringIO(text), header=None, **read_kwargs)
+    text = decode_uploaded_bytes(raw)
+    sep = detect_csv_separator(text)
+    return pd.read_csv(io.StringIO(text), header=None, sep=sep, on_bad_lines="skip")
 
 
 def match_product_name(raw_name: str, product_names: list[str]) -> str | None:
@@ -675,6 +905,18 @@ def match_product_name(raw_name: str, product_names: list[str]) -> str | None:
     lower_map = {n.lower(): n for n in product_names}
     if name.lower() in lower_map:
         return lower_map[name.lower()]
+
+    alias_entries: list[tuple[int, str, str]] = []
+    for catalog, patterns in PRODUCT_NAME_ALIASES.items():
+        if catalog not in product_names:
+            continue
+        for pattern in patterns:
+            alias_entries.append((len(pattern), catalog, pattern))
+    alias_entries.sort(key=lambda x: x[0], reverse=True)
+    for _plen, catalog, pattern in alias_entries:
+        if name == pattern or pattern in name:
+            return catalog
+
     for pn in product_names:
         if pn in name or name in pn:
             return pn
@@ -1072,7 +1314,7 @@ def render_square_upload_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) 
 
     st.markdown("#### アップロードされたファイル")
     for f in files:
-        kind = classify_uploaded_csv(read_uploaded_csv(f), products_df)
+        kind, _df = load_uploaded_dataframe(f, products_df)
         label = {"product_matrix": "商品別マトリックス", "sales_summary": "売上サマリー", "unknown": "未判定"}.get(kind, kind)
         st.write(f"- **{f.name}** → {label}")
 
