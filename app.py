@@ -216,11 +216,62 @@ def find_column(columns: list[str], keys: list[str]) -> str | None:
 
 
 def detect_column_mapping(columns: list[str]) -> dict[str, str | None]:
-    return {key: find_column(columns, aliases) for key, aliases in COLUMN_ALIASES.items()}
+    mapping: dict[str, str | None] = {
+        key: find_column(columns, aliases) for key, aliases in COLUMN_ALIASES.items()
+    }
+    mapping["matrix_item_column"] = find_matrix_item_column(columns)
+    date_cols = get_matrix_date_columns(columns)
+    mapping["matrix_date_columns"] = ", ".join(date_cols[:8]) + (" ..." if len(date_cols) > 8 else "") if date_cols else None
+    mapping["format"] = "マトリックス（日付=横）" if (find_matrix_item_column(columns) and date_cols) else "縦持ち"
+    return mapping
+
+
+MATRIX_ITEM_ALIASES = COLUMN_ALIASES["item"] + ["カテゴリ", "category", "種別", "メニュー区分", "分類"]
+SKIP_ROW_KEYWORDS = ["合計", "総計", "小計", "計", "total", "subtotal", "カテゴリ合計"]
+
+
+def parse_column_as_date(col_name: str) -> date | None:
+    """列名が日付（例: 2026/5/1）かどうかを判定する。"""
+    s = str(col_name).strip()
+    if not s or s.lower() in ("nan", "none", ""):
+        return None
+    if find_column([s], MATRIX_ITEM_ALIASES + COLUMN_ALIASES["quantity"]):
+        return None
+    parsed = pd.to_datetime(s, format="mixed", errors="coerce")
+    if pd.isna(parsed):
+        return None
+    if parsed.year < 2000 or parsed.year > 2100:
+        return None
+    return parsed.date()
+
+
+def get_matrix_date_columns(columns: list[str]) -> list[str]:
+    return [c for c in columns if parse_column_as_date(c) is not None]
+
+
+def find_matrix_item_column(columns: list[str]) -> str | None:
+    return find_column(columns, MATRIX_ITEM_ALIASES)
+
+
+def is_matrix_format_df(df: pd.DataFrame) -> bool:
+    """日付が横方向・商品名が縦方向のマトリックス形式か。"""
+    cols = [str(c) for c in df.columns]
+    item_col = find_matrix_item_column(cols)
+    date_cols = get_matrix_date_columns(cols)
+    return item_col is not None and len(date_cols) >= 1
+
+
+def is_probable_matrix_header_row(row_vals: list[str]) -> bool:
+    row_cols = [str(v).strip() for v in row_vals if str(v).strip() and str(v).lower() != "nan"]
+    has_item = find_column(row_cols, MATRIX_ITEM_ALIASES) is not None
+    date_count = len(get_matrix_date_columns(row_cols))
+    return has_item and date_count >= 2
 
 
 def is_probable_header_row(row_vals: list[str]) -> bool:
-    """日付列と（商品名 or 数量）列が同じ行に揃っているか。"""
+    """縦持ち形式、またはマトリックス形式のヘッダー行か。"""
+    if is_probable_matrix_header_row(row_vals):
+        return True
     row_cols = [str(v).strip() for v in row_vals if str(v).strip() and str(v).lower() != "nan"]
     if len(row_cols) < 2:
         return False
@@ -228,6 +279,64 @@ def is_probable_header_row(row_vals: list[str]) -> bool:
     has_item = find_column(row_cols, COLUMN_ALIASES["item"]) is not None
     has_qty = find_column(row_cols, COLUMN_ALIASES["quantity"]) is not None
     return has_date and (has_item or has_qty)
+
+
+def is_summary_row_label(name: str) -> bool:
+    label = str(name).strip().lower()
+    return any(k in label for k in SKIP_ROW_KEYWORDS)
+
+
+def matrix_to_long_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """マトリックス形式 → 縦持ち（日付, 商品名, 数量）へ変換。"""
+    cols = [str(c) for c in df.columns]
+    item_col = find_matrix_item_column(cols)
+    date_cols = get_matrix_date_columns(cols)
+    if not item_col or not date_cols:
+        raise ValueError("マトリックス形式の列構成を認識できませんでした。")
+
+    long_df = df[[item_col] + date_cols].copy()
+    long_df = long_df.melt(id_vars=[item_col], value_vars=date_cols, var_name="_date_col", value_name="quantity")
+    long_df["date"] = long_df["_date_col"].apply(lambda x: parse_column_as_date(str(x)))
+    long_df = long_df.dropna(subset=["date"])
+    long_df["product_name"] = long_df[item_col].astype(str).str.strip()
+    long_df["quantity"] = pd.to_numeric(long_df["quantity"], errors="coerce").fillna(0).astype(int)
+    long_df = long_df[long_df["product_name"].astype(str).str.len() > 0]
+    long_df = long_df[~long_df["product_name"].apply(is_summary_row_label)]
+    return long_df[["date", "product_name", "quantity"]]
+
+
+def parse_matrix_format(df: pd.DataFrame, products_df: pd.DataFrame) -> tuple[list[DayImport], list[str]]:
+    """横持ちマトリックス（日付=列、商品=行）を日次データへ変換。"""
+    warnings: list[str] = ["マトリックス形式CSVを検出しました（日付が横方向）。"]
+    long_df = matrix_to_long_dataframe(df)
+    if long_df.empty:
+        raise ValueError("マトリックス形式CSVから有効な販売データを抽出できませんでした。")
+
+    product_names = products_df["name"].astype(str).tolist()
+    price_map = dict(zip(products_df["name"], products_df["unit_price"]))
+    imports: list[DayImport] = []
+
+    for day_val, day_group in long_df.groupby("date"):
+        units = {name: 0 for name in product_names}
+        unmapped: list[str] = []
+        for _, row in day_group.iterrows():
+            matched = match_product_name(row["product_name"], product_names)
+            if not matched:
+                unmapped.append(str(row["product_name"]))
+                continue
+            units[matched] = units.get(matched, 0) + int(row["quantity"])
+
+        if unmapped:
+            sample = ", ".join(sorted(set(unmapped))[:5])
+            warnings.append(f"{day_val}: 未登録商品をスキップ（例: {sample}）")
+
+        day_sales = sum(units.get(n, 0) * int(price_map.get(n, 0)) for n in product_names)
+        total_units = sum(units.values())
+        customers = max(100, int(total_units / 0.12)) if total_units > 0 else 0
+        imports.append(DayImport(day_val, int(day_sales), customers, units))
+
+    warnings.append("総客数・店舗総売上は、商品販売数から推定しています（マトリックスCSVに客数・売上列なし）。")
+    return imports, warnings
 
 
 def prepare_square_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -333,11 +442,15 @@ def parse_square_csv(df: pd.DataFrame, products_df: pd.DataFrame) -> tuple[list[
     cols = [str(c) for c in df.columns.tolist()]
     product_names = products_df["name"].astype(str).tolist()
 
+    # 横持ちマトリックス（日付が列・商品名が行）
+    if is_matrix_format_df(df):
+        return parse_matrix_format(df, products_df)
+
     date_col = find_column(cols, COLUMN_ALIASES["date"])
     if not date_col:
         raise ValueError(
             "日付列が見つかりません。CSVの列名をご確認ください。"
-            "（対応例: 日付 / 時期 / Date / 取引日時）"
+            "（対応例: 日付 / 時期 / Date / 取引日時、または日付が横並びのマトリックス形式）"
         )
 
     work = df.copy()
