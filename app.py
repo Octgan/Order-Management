@@ -157,12 +157,14 @@ def find_column(columns: list[str], keys: list[str]) -> str | None:
 
 def read_uploaded_csv(uploaded_file: Any) -> pd.DataFrame:
     raw = uploaded_file.getvalue()
+    read_kwargs: dict[str, Any] = {"on_bad_lines": "skip"}
     for enc in ("utf-8-sig", "utf-8", "cp932", "shift_jis"):
         try:
-            return pd.read_csv(io.BytesIO(raw), encoding=enc)
+            return pd.read_csv(io.BytesIO(raw), encoding=enc, **read_kwargs)
         except UnicodeDecodeError:
             continue
-    return pd.read_csv(io.BytesIO(raw), encoding="utf-8", errors="replace")
+    text = raw.decode("utf-8", errors="replace")
+    return pd.read_csv(io.StringIO(text), **read_kwargs)
 
 
 def match_product_name(raw_name: str, product_names: list[str]) -> str | None:
