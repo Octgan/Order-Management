@@ -68,8 +68,6 @@ COLUMN_ALIASES: dict[str, list[str]] = {
         "売上日",
         "datetime",
         "date time",
-        "期間",
-        "レポート期間",
     ],
     "time": ["time", "時刻", "取引時刻", "時間"],
     "item": [
@@ -221,13 +219,24 @@ def detect_column_mapping(columns: list[str]) -> dict[str, str | None]:
     return {key: find_column(columns, aliases) for key, aliases in COLUMN_ALIASES.items()}
 
 
+def is_probable_header_row(row_vals: list[str]) -> bool:
+    """日付列と（商品名 or 数量）列が同じ行に揃っているか。"""
+    row_cols = [str(v).strip() for v in row_vals if str(v).strip() and str(v).lower() != "nan"]
+    if len(row_cols) < 2:
+        return False
+    has_date = find_column(row_cols, COLUMN_ALIASES["date"]) is not None
+    has_item = find_column(row_cols, COLUMN_ALIASES["item"]) is not None
+    has_qty = find_column(row_cols, COLUMN_ALIASES["quantity"]) is not None
+    return has_date and (has_item or has_qty)
+
+
 def prepare_square_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Square CSVの先頭メタ行をスキップし、ヘッダー行を自動検出する。"""
     if df.empty:
         return df
 
     cols = [str(c) for c in df.columns]
-    if find_column(cols, COLUMN_ALIASES["date"]):
+    if is_probable_header_row(cols):
         out = df.copy()
         out.columns = [str(c).strip() for c in out.columns]
         return out
@@ -236,7 +245,7 @@ def prepare_square_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     scan_limit = min(25, len(df))
     for idx in range(scan_limit):
         row_vals = [str(v).strip() for v in df.iloc[idx].tolist()]
-        if find_column(row_vals, COLUMN_ALIASES["date"]):
+        if is_probable_header_row(row_vals):
             headers = [str(v).strip() for v in df.iloc[idx].tolist()]
             body = df.iloc[idx + 1 :].copy()
             body.columns = headers
