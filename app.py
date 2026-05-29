@@ -1,12 +1,15 @@
 """
-手動入力型 フード発注管理アプリ
-- データ入力タブ: 日次営業データの保存
-- 商品管理タブ: 新商品追加 / 販売終了
-- ダッシュボードタブ: KPI可視化 / 発注予測
+Square CSV連携 + 手動修正型 フード発注管理アプリ
+- Square売上CSVアップロードで一括取り込み
+- 過去データの確認・修正 / 商品管理
+- ダッシュボード・発注予測
 """
 
 from __future__ import annotations
 
+import io
+import re
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -19,7 +22,7 @@ import streamlit as st
 # ---------------------------------------------------------------------------
 # 設定
 # ---------------------------------------------------------------------------
-APP_TITLE = "手動入力型 フード発注管理"
+APP_TITLE = "Square CSV連携 フード発注管理"
 DAILY_REVENUE_TARGET = 1_000_000
 COLD_STORAGE_CAPACITY = 300
 
@@ -51,7 +54,29 @@ BASE_QTY_BY_NAME: dict[str, int] = {
     "季節のソースとグラノーラ": 105,
 }
 
+# Square CSV 列名の候補（日本語・英語）
+COLUMN_ALIASES: dict[str, list[str]] = {
+    "date": ["date", "日付", "取引日", "営業日", "day", "売上日"],
+    "item": ["item", "item name", "商品名", "品目", "メニュー", "商品", "アイテム"],
+    "quantity": ["qty", "quantity", "数量", "販売数", "個数", "sold", "販売個数"],
+    "net_sales": ["net sales", "ネット売上", "純売上", "net"],
+    "gross_sales": ["gross sales", "総売上", "売上", "gross", "売上高"],
+    "customers": ["customers", "客数", "来店客数", "取引数", "transactions", "transaction count", "総客数"],
+    "total_sales": ["total sales", "店舗売上", "総売上高", "売上合計", "店舗総売上"],
+}
 
+
+@dataclass
+class DayImport:
+    day: date
+    total_sales: int
+    total_customers: int
+    units_by_product: dict[str, int]
+
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
 def inject_css() -> None:
     st.markdown(
         """
@@ -79,25 +104,160 @@ def to_ts(d: date) -> pd.Timestamp:
     return pd.Timestamp(d)
 
 
+def normalize_col(name: str) -> str:
+    return re.sub(r"\s+", " ", str(name).strip().lower())
+
+
+def find_column(columns: list[str], keys: list[str]) -> str | None:
+    normalized = {normalize_col(c): c for c in columns}
+    for key in keys:
+        if key in normalized:
+            return normalized[key]
+    for col_norm, original in normalized.items():
+        for key in keys:
+            if key in col_norm or col_norm in key:
+                return original
+    return None
+
+
+def read_uploaded_csv(uploaded_file: Any) -> pd.DataFrame:
+    raw = uploaded_file.getvalue()
+    for enc in ("utf-8-sig", "utf-8", "cp932", "shift_jis"):
+        try:
+            return pd.read_csv(io.BytesIO(raw), encoding=enc)
+        except UnicodeDecodeError:
+            continue
+    return pd.read_csv(io.BytesIO(raw), encoding="utf-8", errors="replace")
+
+
+def match_product_name(raw_name: str, product_names: list[str]) -> str | None:
+    name = str(raw_name).strip()
+    if not name:
+        return None
+    if name in product_names:
+        return name
+    lower_map = {n.lower(): n for n in product_names}
+    if name.lower() in lower_map:
+        return lower_map[name.lower()]
+    for pn in product_names:
+        if pn in name or name in pn:
+            return pn
+    return None
+
+
+def parse_square_csv(df: pd.DataFrame, products_df: pd.DataFrame) -> tuple[list[DayImport], list[str]]:
+    """SquareエクスポートCSVを日次データへ変換する。"""
+    warnings: list[str] = []
+    cols = df.columns.astype(str).tolist()
+    product_names = products_df["name"].astype(str).tolist()
+
+    date_col = find_column(cols, COLUMN_ALIASES["date"])
+    if not date_col:
+        raise ValueError("日付列が見つかりません。CSVの列名をご確認ください。")
+
+    work = df.copy()
+    work[date_col] = pd.to_datetime(work[date_col], format="mixed", errors="coerce")
+    work = work.dropna(subset=[date_col])
+    if work.empty:
+        raise ValueError("有効な日付データがありません。")
+
+    item_col = find_column(cols, COLUMN_ALIASES["item"])
+    qty_col = find_column(cols, COLUMN_ALIASES["quantity"])
+    customers_col = find_column(cols, COLUMN_ALIASES["customers"])
+    total_sales_col = find_column(cols, COLUMN_ALIASES["total_sales"])
+    net_sales_col = find_column(cols, COLUMN_ALIASES["net_sales"])
+    gross_sales_col = find_column(cols, COLUMN_ALIASES["gross_sales"])
+
+    # 横持ち（商品名が列）形式の判定
+    wide_product_cols = [c for c in cols if match_product_name(c, product_names)]
+    imports: list[DayImport] = []
+
+    if wide_product_cols and not item_col:
+        for day_val, group in work.groupby(work[date_col].dt.date):
+            units: dict[str, int] = {}
+            for col in wide_product_cols:
+                matched = match_product_name(col, product_names)
+                if matched:
+                    units[matched] = int(pd.to_numeric(group[col], errors="coerce").fillna(0).sum())
+            day_sales = 0
+            if total_sales_col:
+                day_sales = int(pd.to_numeric(group[total_sales_col], errors="coerce").fillna(0).sum())
+            elif net_sales_col:
+                day_sales = int(pd.to_numeric(group[net_sales_col], errors="coerce").fillna(0).sum())
+            else:
+                day_sales = sum(units.get(n, 0) * int(products_df.loc[products_df["name"] == n, "unit_price"].iloc[0]) for n in units)
+            customers = 0
+            if customers_col:
+                customers = int(pd.to_numeric(group[customers_col], errors="coerce").fillna(0).max())
+            else:
+                customers = max(100, int(sum(units.values()) / 0.12))
+                warnings.append(f"{day_val}: 客数列が無いため推定値を使用しました。")
+            imports.append(DayImport(day_val, day_sales, customers, units))
+        return imports, warnings
+
+    # 縦持ち（商品名×数量）形式
+    if not item_col or not qty_col:
+        raise ValueError(
+            "商品別データ形式として認識できませんでした。"
+            "「商品名」「数量」列、または商品名が列名の横持ちCSVをご利用ください。"
+        )
+
+    sales_col = net_sales_col or gross_sales_col
+    for day_val, group in work.groupby(work[date_col].dt.date):
+        units: dict[str, int] = {}
+        unmapped: list[str] = []
+        for _, row in group.iterrows():
+            matched = match_product_name(row[item_col], product_names)
+            if not matched:
+                unmapped.append(str(row[item_col]))
+                continue
+            qty = int(pd.to_numeric(row[qty_col], errors="coerce") or 0)
+            units[matched] = units.get(matched, 0) + qty
+
+        if unmapped:
+            sample = ", ".join(sorted(set(unmapped))[:5])
+            warnings.append(f"{day_val}: 未登録商品をスキップしました（例: {sample}）")
+
+        if total_sales_col:
+            day_sales = int(pd.to_numeric(group[total_sales_col], errors="coerce").fillna(0).max())
+        elif sales_col:
+            day_sales = int(pd.to_numeric(group[sales_col], errors="coerce").fillna(0).sum())
+        else:
+            price_map = dict(zip(products_df["name"], products_df["unit_price"]))
+            day_sales = sum(units.get(n, 0) * int(price_map.get(n, 0)) for n in units)
+
+        if customers_col:
+            customers = int(pd.to_numeric(group[customers_col], errors="coerce").fillna(0).max())
+        else:
+            customers = max(100, int(sum(units.values()) / 0.12))
+            warnings.append(f"{day_val}: 客数列が無いため推定値を使用しました。")
+
+        imports.append(DayImport(day_val, day_sales, customers, units))
+
+    return imports, warnings
+
+
+# ---------------------------------------------------------------------------
+# データ永続化
+# ---------------------------------------------------------------------------
 def ensure_data_files() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     if not PRODUCTS_CSV.exists():
         now = datetime.now().isoformat()
-        rows = []
-        for idx, p in enumerate(DEFAULT_PRODUCTS, start=1):
-            rows.append(
-                {
-                    "product_id": f"FOOD_{idx:03d}",
-                    "name": p["name"],
-                    "unit_price": int(p["unit_price"]),
-                    "is_active": 1,
-                    "created_at": now,
-                }
-            )
+        rows = [
+            {
+                "product_id": f"FOOD_{idx:03d}",
+                "name": p["name"],
+                "unit_price": int(p["unit_price"]),
+                "is_active": 1,
+                "created_at": now,
+            }
+            for idx, p in enumerate(DEFAULT_PRODUCTS, start=1)
+        ]
         pd.DataFrame(rows).to_csv(PRODUCTS_CSV, index=False, encoding="utf-8-sig")
 
-    if not DAILY_CSV.exists():
+    if not DAILY_CSV.exists() or DAILY_CSV.stat().st_size == 0:
         pd.DataFrame(
             columns=[
                 "date",
@@ -110,9 +270,7 @@ def ensure_data_files() -> None:
                 "created_at",
             ]
         ).to_csv(DAILY_CSV, index=False, encoding="utf-8-sig")
-
-    # 常に最低1か月分のダミー日次データを補完
-    seed_initial_data(days=35, seed=42)
+        seed_initial_data(days=35, seed=42)
 
 
 def load_products() -> pd.DataFrame:
@@ -123,15 +281,14 @@ def load_products() -> pd.DataFrame:
 
 
 def load_daily_sales() -> pd.DataFrame:
-    if DAILY_CSV.stat().st_size == 0:
+    if not DAILY_CSV.exists() or DAILY_CSV.stat().st_size == 0:
         return pd.DataFrame()
     df = pd.read_csv(DAILY_CSV, encoding="utf-8-sig")
     if df.empty:
         return df
     df["date"] = pd.to_datetime(df["date"], format="mixed", errors="coerce")
     df = df.dropna(subset=["date"]).copy()
-    numeric_cols = ["total_sales", "total_customers", "unit_price", "units_sold"]
-    for col in numeric_cols:
+    for col in ["total_sales", "total_customers", "unit_price", "units_sold"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
     return df
 
@@ -147,13 +304,12 @@ def save_daily_input(
     target_ts = to_ts(target_date)
     now = datetime.now().isoformat()
 
-    # 同日データは上書き
     if not daily_df.empty:
         daily_df = daily_df[daily_df["date"] != target_ts]
 
     rows = []
     for _, row in products_df.iterrows():
-        name = row["name"]
+        name = str(row["name"])
         rows.append(
             {
                 "date": target_ts.strftime("%Y-%m-%d"),
@@ -167,17 +323,38 @@ def save_daily_input(
             }
         )
 
-    new_df = pd.DataFrame(rows)
-    merged = pd.concat([daily_df, new_df], ignore_index=True)
+    merged = pd.concat([daily_df, pd.DataFrame(rows)], ignore_index=True)
     merged.to_csv(DAILY_CSV, index=False, encoding="utf-8-sig")
 
 
+def bulk_import_days(imports: list[DayImport], products_df: pd.DataFrame, overwrite: bool = True) -> tuple[int, int]:
+    """複数日分を一括取り込み。戻り値: (新規日数, 上書き日数)"""
+    daily_df = load_daily_sales()
+    existing_dates = set(daily_df["date"].dt.date.tolist()) if not daily_df.empty else set()
+    created, updated = 0, 0
+
+    active_products = products_df[products_df["is_active"] == 1].copy()
+    if active_products.empty:
+        active_products = products_df.copy()
+
+    for day_data in imports:
+        if day_data.day in existing_dates:
+            if not overwrite:
+                continue
+            updated += 1
+        else:
+            created += 1
+        units = {name: day_data.units_by_product.get(name, 0) for name in active_products["name"].astype(str)}
+        save_daily_input(day_data.day, day_data.total_sales, day_data.total_customers, units, active_products)
+
+    return created, updated
+
+
 def get_daily_record_by_date(daily_df: pd.DataFrame, target_date: date) -> tuple[dict[str, int], dict[str, int]]:
-    """指定日の総売上/総客数と商品別販売数を返す。"""
     if daily_df.empty:
         return {"total_sales": 0, "total_customers": 0}, {}
     target_ts = to_ts(target_date)
-    day_rows = daily_df[daily_df["date"] == target_ts].copy()
+    day_rows = daily_df[daily_df["date"] == target_ts]
     if day_rows.empty:
         return {"total_sales": 0, "total_customers": 0}, {}
     totals = {
@@ -201,7 +378,7 @@ def make_daily_summary_table(daily_df: pd.DataFrame) -> pd.DataFrame:
         .sort_values("date", ascending=False)
     )
     summary["date"] = summary["date"].dt.date.astype(str)
-    summary = summary.rename(
+    return summary.rename(
         columns={
             "date": "日付",
             "total_sales": "店舗総売上",
@@ -209,14 +386,11 @@ def make_daily_summary_table(daily_df: pd.DataFrame) -> pd.DataFrame:
             "total_food_units": "フード販売合計",
         }
     )
-    return summary
 
 
 def add_product(name: str, unit_price: int) -> None:
     products_df = load_products()
-    existing_names = set(products_df["name"].astype(str).tolist())
-    if name in existing_names:
-        # 既存商品が非アクティブなら復帰
+    if name in set(products_df["name"].astype(str)):
         products_df.loc[products_df["name"] == name, "is_active"] = 1
         products_df.loc[products_df["name"] == name, "unit_price"] = int(unit_price)
     else:
@@ -224,19 +398,23 @@ def add_product(name: str, unit_price: int) -> None:
         next_num = len(ids) + 1
         while f"FOOD_{next_num:03d}" in ids:
             next_num += 1
-        new_row = pd.DataFrame(
+        products_df = pd.concat(
             [
-                {
-                    "product_id": f"FOOD_{next_num:03d}",
-                    "name": name,
-                    "unit_price": int(unit_price),
-                    "is_active": 1,
-                    "created_at": datetime.now().isoformat(),
-                }
-            ]
+                products_df,
+                pd.DataFrame(
+                    [
+                        {
+                            "product_id": f"FOOD_{next_num:03d}",
+                            "name": name,
+                            "unit_price": int(unit_price),
+                            "is_active": 1,
+                            "created_at": datetime.now().isoformat(),
+                        }
+                    ]
+                ),
+            ],
+            ignore_index=True,
         )
-        products_df = pd.concat([products_df, new_row], ignore_index=True)
-
     products_df.to_csv(PRODUCTS_CSV, index=False, encoding="utf-8-sig")
 
 
@@ -253,13 +431,10 @@ def activate_product(product_id: str) -> None:
 
 
 def seed_initial_data(days: int = 35, seed: int = 42) -> None:
-    """初回起動時に約1か月分のリアルなダミーデータを投入する。"""
     rng = np.random.default_rng(seed)
     products_df = load_products()
     daily_df = load_daily_sales()
-    existing_dates = set()
-    if not daily_df.empty:
-        existing_dates = set(daily_df["date"].dt.date.tolist())
+    existing_dates = set(daily_df["date"].dt.date.tolist()) if not daily_df.empty else set()
 
     for d_offset in range(days, -1, -1):
         d = date.today() - timedelta(days=d_offset)
@@ -269,7 +444,6 @@ def seed_initial_data(days: int = 35, seed: int = 42) -> None:
         day_factor = 1.0 + (0.22 if weekday >= 4 else 0.0) + (0.07 if weekday == 5 else 0.10 if weekday == 6 else 0.0)
         noise = float(rng.normal(1.0, 0.07))
         total_customers = int(1900 * day_factor * noise)
-
         units_by_product: dict[str, int] = {}
         calc_food_sales = 0
         for _, p in products_df.iterrows():
@@ -277,48 +451,42 @@ def seed_initial_data(days: int = 35, seed: int = 42) -> None:
             units = max(25, int(base * day_factor * noise * float(rng.uniform(0.90, 1.12))))
             units_by_product[str(p["name"])] = units
             calc_food_sales += units * int(p["unit_price"])
-
-        # フード以外売上(ドリンク等)を加味し、日商100万規模に寄せる
         beverage_sales = int(total_customers * float(rng.uniform(290, 360)))
-        total_sales = int(calc_food_sales + beverage_sales)
-        save_daily_input(d, total_sales, total_customers, units_by_product, products_df)
+        save_daily_input(d, int(calc_food_sales + beverage_sales), total_customers, units_by_product, products_df)
 
 
+# ---------------------------------------------------------------------------
+# 分析・グラフ
+# ---------------------------------------------------------------------------
 def get_day_totals(daily_df: pd.DataFrame) -> pd.DataFrame:
     if daily_df.empty:
         return pd.DataFrame(columns=["date", "total_sales", "total_customers"])
-    day_totals = (
+    return (
         daily_df.sort_values("date")
         .groupby("date", as_index=False)[["total_sales", "total_customers"]]
         .first()
     )
-    return day_totals
 
 
 def get_same_weekday_df(daily_df: pd.DataFrame, target_date: date, product_id: str) -> pd.DataFrame:
     ref_ts = to_ts(target_date)
-    wd = ref_ts.weekday()
     mask = (
         (daily_df["product_id"] == product_id)
-        & (daily_df["date"].dt.weekday == wd)
+        & (daily_df["date"].dt.weekday == ref_ts.weekday())
         & (daily_df["date"] < ref_ts)
     )
     return daily_df.loc[mask].copy()
 
 
 def last_week_same_day_sales(daily_df: pd.DataFrame, product_id: str, ref: date) -> int:
-    last_week_ts = to_ts(ref - timedelta(days=7))
-    row = daily_df[(daily_df["date"] == last_week_ts) & (daily_df["product_id"] == product_id)]
+    row = daily_df[(daily_df["date"] == to_ts(ref - timedelta(days=7))) & (daily_df["product_id"] == product_id)]
     return int(row["units_sold"].iloc[0]) if not row.empty else 0
 
 
 def four_week_same_weekday_avg(daily_df: pd.DataFrame, product_id: str, ref: date) -> float:
     hist = get_same_weekday_df(daily_df, ref, product_id)
-    cutoff = to_ts(ref - timedelta(days=28))
-    last_4 = hist[hist["date"] >= cutoff]
-    if last_4.empty:
-        return 0.0
-    return float(last_4["units_sold"].mean())
+    last_4 = hist[hist["date"] >= to_ts(ref - timedelta(days=28))]
+    return float(last_4["units_sold"].mean()) if not last_4.empty else 0.0
 
 
 def calc_food_selection_rate(daily_df: pd.DataFrame, product_id: str, day_totals: pd.DataFrame, days: int = 7) -> float:
@@ -326,11 +494,7 @@ def calc_food_selection_rate(daily_df: pd.DataFrame, product_id: str, day_totals
         return 0.0
     end = to_ts(date.today())
     start = to_ts(date.today() - timedelta(days=days))
-    sub = daily_df[
-        (daily_df["product_id"] == product_id)
-        & (daily_df["date"] >= start)
-        & (daily_df["date"] <= end)
-    ]
+    sub = daily_df[(daily_df["product_id"] == product_id) & (daily_df["date"] >= start) & (daily_df["date"] <= end)]
     totals = day_totals[(day_totals["date"] >= start) & (day_totals["date"] <= end)]
     customer_sum = int(totals["total_customers"].sum())
     if sub.empty or customer_sum == 0:
@@ -349,178 +513,140 @@ def plot_weekday_comparison(last_week: int, four_week_avg: float, product_name: 
             textposition="outside",
         )
     )
-    fig.update_layout(
-        title=f"{product_name} — 同曜日販売数の比較",
-        yaxis_title="販売数（個）",
-        template="plotly_white",
-        showlegend=False,
-        height=360,
-    )
+    fig.update_layout(title=f"{product_name} — 同曜日販売数の比較", yaxis_title="販売数（個）", template="plotly_white", height=360, showlegend=False)
     return fig
 
 
 def plot_daily_trend(product_df: pd.DataFrame, product_name: str) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(
-        go.Scatter(
-            x=product_df["date"],
-            y=product_df["units_sold"],
-            mode="lines+markers",
-            name="販売個数",
-            line=dict(color="#e94560", width=3),
-        )
+        go.Scatter(x=product_df["date"], y=product_df["units_sold"], mode="lines+markers", name="販売個数", line=dict(color="#e94560", width=3))
     )
-    fig.update_layout(
-        title=f"{product_name} — 日次販売推移",
-        xaxis_title="日付",
-        yaxis_title="販売数（個）",
-        template="plotly_white",
-        hovermode="x unified",
-        height=400,
-    )
+    fig.update_layout(title=f"{product_name} — 日次販売推移", xaxis_title="日付", yaxis_title="販売数（個）", template="plotly_white", height=400, hovermode="x unified")
     return fig
 
 
-def render_data_input_tab(products_df: pd.DataFrame) -> None:
-    st.markdown('<p class="section-title">日々の営業データ入力</p>', unsafe_allow_html=True)
-    active_df = products_df[products_df["is_active"] == 1].copy()
-    if active_df.empty:
-        st.warning("有効な商品がありません。先に「商品管理」タブで商品を追加してください。")
+# ---------------------------------------------------------------------------
+# タブUI
+# ---------------------------------------------------------------------------
+def render_square_upload_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> None:
+    st.markdown('<p class="section-title">Square売上CSVアップロード</p>', unsafe_allow_html=True)
+    st.caption("Squareダッシュボードからエクスポートした売上CSVをドラッグ＆ドロップで取り込みます。")
+
+    uploaded = st.file_uploader("Square売上CSVファイル", type=["csv"], accept_multiple_files=False)
+    overwrite = st.checkbox("既存日付のデータは上書きする", value=True)
+
+    if uploaded is None:
+        st.info("CSVをアップロードすると、取り込みプレビューが表示されます。")
         return
 
-    daily_df = load_daily_sales()
-    with st.form("daily_input_form"):
-        target_date = st.date_input("日付", value=date.today())
-        c1, c2 = st.columns(2)
-        with c1:
-            total_sales = st.number_input("店舗全体の売上高（円）", min_value=0, value=1_000_000, step=10_000)
-        with c2:
-            total_customers = st.number_input("総客数（人）", min_value=0, value=2_000, step=10)
+    try:
+        raw_df = read_uploaded_csv(uploaded)
+        imports, warnings = parse_square_csv(raw_df, products_df)
+    except Exception as exc:
+        st.error(f"CSVの読み込みに失敗しました: {exc}")
+        with st.expander("CSVの先頭行を確認"):
+            st.dataframe(raw_df.head(20), use_container_width=True)
+        return
 
-        st.markdown("#### 商品別の販売個数")
-        units_by_product: dict[str, int] = {}
-        col_left, col_right = st.columns(2)
-        active_rows = list(active_df.itertuples(index=False))
-        half = (len(active_rows) + 1) // 2
-        left_rows = active_rows[:half]
-        right_rows = active_rows[half:]
+    if not imports:
+        st.warning("取り込み可能な日次データがありませんでした。")
+        return
 
-        with col_left:
-            for p in left_rows:
-                units_by_product[p.name] = int(
-                    st.number_input(
-                        f"{p.name}（個）",
-                        min_value=0,
-                        value=max(20, BASE_QTY_BY_NAME.get(str(p.name), 80)),
-                        step=1,
-                        key=f"units_left_{p.product_id}",
-                    )
-                )
-        with col_right:
-            for p in right_rows:
-                units_by_product[p.name] = int(
-                    st.number_input(
-                        f"{p.name}（個）",
-                        min_value=0,
-                        value=max(20, BASE_QTY_BY_NAME.get(str(p.name), 80)),
-                        step=1,
-                        key=f"units_right_{p.product_id}",
-                    )
-                )
+    preview_rows = []
+    for d in imports:
+        preview_rows.append(
+            {
+                "日付": d.day.strftime("%Y-%m-%d"),
+                "店舗総売上": d.total_sales,
+                "総客数": d.total_customers,
+                "フード販売合計": sum(d.units_by_product.values()),
+            }
+        )
+    st.markdown("#### 取り込みプレビュー")
+    st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
 
-        submitted = st.form_submit_button("データを保存する", type="primary", use_container_width=True)
+    existing_dates = set(daily_df["date"].dt.date.tolist()) if not daily_df.empty else set()
+    overlap = [d.day for d in imports if d.day in existing_dates]
+    if overlap:
+        st.warning(f"既存データと重複する日付: {len(overlap)}日（上書き設定: {'ON' if overwrite else 'OFF'}）")
 
-    if submitted:
-        if not daily_df.empty and (daily_df["date"] == to_ts(target_date)).any():
-            st.warning(f"{target_date} は既存データがあるため、上書き保存しました。")
-        save_daily_input(target_date, int(total_sales), int(total_customers), units_by_product, active_df)
-        st.success(f"{target_date} の営業データを保存しました。")
+    for msg in warnings[:8]:
+        st.caption(f"⚠ {msg}")
+    if len(warnings) > 8:
+        st.caption(f"…他 {len(warnings) - 8} 件")
+
+    if st.button("データを一括取り込み", type="primary", use_container_width=True):
+        created, updated = bulk_import_days(imports, products_df, overwrite=overwrite)
+        st.success(f"取り込み完了: 新規 {created} 日 / 上書き {updated} 日")
         st.rerun()
 
 
 def render_history_edit_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> None:
     st.markdown('<p class="section-title">過去データの確認・修正</p>', unsafe_allow_html=True)
+    st.caption("CSV取り込み後の数値訂正や、1日分の手動追加ができます。")
+
+    with st.expander("1日分を手動で追加・上書き"):
+        active_df = products_df[products_df["is_active"] == 1].copy()
+        if active_df.empty:
+            st.warning("有効な商品がありません。")
+        else:
+            with st.form("manual_day_form"):
+                target_date = st.date_input("日付", value=date.today(), key="manual_date")
+                c1, c2 = st.columns(2)
+                with c1:
+                    total_sales = st.number_input("店舗総売上（円）", min_value=0, value=1_000_000, step=10_000)
+                with c2:
+                    total_customers = st.number_input("総客数（人）", min_value=0, value=2_000, step=10)
+                units_by_product: dict[str, int] = {}
+                for p in active_df.itertuples(index=False):
+                    units_by_product[p.name] = int(
+                        st.number_input(f"{p.name}（個）", min_value=0, value=80, step=1, key=f"manual_{p.product_id}")
+                    )
+                manual_submit = st.form_submit_button("この日のデータを保存", use_container_width=True)
+            if manual_submit:
+                if not daily_df.empty and (daily_df["date"] == to_ts(target_date)).any():
+                    st.warning(f"{target_date} の既存データを上書き保存しました。")
+                save_daily_input(target_date, int(total_sales), int(total_customers), units_by_product, active_df)
+                st.success("保存しました。")
+                st.rerun()
+
     if daily_df.empty:
-        st.info("まだ営業データがありません。先に「データ入力」タブから登録してください。")
+        st.info("まだ営業データがありません。先に「Square CSVアップロード」から取り込んでください。")
         return
 
-    summary_table = make_daily_summary_table(daily_df)
-    st.markdown("#### 登録済みデータ一覧")
-    st.dataframe(summary_table, use_container_width=True, hide_index=True)
-
+    st.dataframe(make_daily_summary_table(daily_df), use_container_width=True, hide_index=True)
     available_dates = sorted(daily_df["date"].dt.date.unique().tolist(), reverse=True)
     selected_date = st.selectbox("修正する日付", available_dates, format_func=lambda d: d.strftime("%Y-%m-%d"))
     totals, units_map = get_daily_record_by_date(daily_df, selected_date)
 
-    st.caption("選択日のデータを編集して「データを更新する」で上書き保存します。")
     with st.form("history_edit_form"):
         c1, c2 = st.columns(2)
         with c1:
-            edit_total_sales = st.number_input(
-                "店舗総売上（円）",
-                min_value=0,
-                value=int(totals.get("total_sales", 0)),
-                step=10_000,
-            )
+            edit_total_sales = st.number_input("店舗総売上（円）", min_value=0, value=int(totals.get("total_sales", 0)), step=10_000)
         with c2:
-            edit_total_customers = st.number_input(
-                "総客数（人）",
-                min_value=0,
-                value=int(totals.get("total_customers", 0)),
-                step=10,
+            edit_total_customers = st.number_input("総客数（人）", min_value=0, value=int(totals.get("total_customers", 0)), step=10)
+        edit_units: dict[str, int] = {}
+        for p in products_df.sort_values("product_id").itertuples(index=False):
+            edit_units[p.name] = int(
+                st.number_input(
+                    f"{p.name}（個）",
+                    min_value=0,
+                    value=int(units_map.get(str(p.name), 0)),
+                    step=1,
+                    key=f"edit_{selected_date}_{p.product_id}",
+                )
             )
-
-        st.markdown("#### 商品別の販売個数（修正）")
-        edit_units_by_product: dict[str, int] = {}
-        left_col, right_col = st.columns(2)
-        product_rows = list(products_df.sort_values("product_id").itertuples(index=False))
-        half = (len(product_rows) + 1) // 2
-        left_rows = product_rows[:half]
-        right_rows = product_rows[half:]
-
-        with left_col:
-            for p in left_rows:
-                default_val = int(units_map.get(str(p.name), 0))
-                edit_units_by_product[p.name] = int(
-                    st.number_input(
-                        f"{p.name}（個）",
-                        min_value=0,
-                        value=default_val,
-                        step=1,
-                        key=f"edit_units_left_{selected_date}_{p.product_id}",
-                    )
-                )
-        with right_col:
-            for p in right_rows:
-                default_val = int(units_map.get(str(p.name), 0))
-                edit_units_by_product[p.name] = int(
-                    st.number_input(
-                        f"{p.name}（個）",
-                        min_value=0,
-                        value=default_val,
-                        step=1,
-                        key=f"edit_units_right_{selected_date}_{p.product_id}",
-                    )
-                )
-
         updated = st.form_submit_button("データを更新する（上書き保存）", type="primary", use_container_width=True)
 
     if updated:
-        save_daily_input(
-            selected_date,
-            int(edit_total_sales),
-            int(edit_total_customers),
-            edit_units_by_product,
-            products_df,
-        )
-        st.success(f"{selected_date} のデータを更新しました。ダッシュボードにも即反映されます。")
+        save_daily_input(selected_date, int(edit_total_sales), int(edit_total_customers), edit_units, products_df)
+        st.success(f"{selected_date} のデータを更新しました。ダッシュボードに即反映されます。")
         st.rerun()
 
 
 def render_product_tab(products_df: pd.DataFrame) -> None:
     st.markdown('<p class="section-title">商品管理</p>', unsafe_allow_html=True)
-    st.caption("新メニュー追加、販売終了（非表示）、再開ができます。")
-
     with st.form("add_product_form", clear_on_submit=True):
         c1, c2 = st.columns([2, 1])
         with c1:
@@ -528,7 +654,6 @@ def render_product_tab(products_df: pd.DataFrame) -> None:
         with c2:
             new_price = st.number_input("単価（円）", min_value=0, value=800, step=10)
         add_submit = st.form_submit_button("商品を追加・登録", type="primary")
-
     if add_submit:
         if not new_name.strip():
             st.error("商品名を入力してください。")
@@ -537,59 +662,43 @@ def render_product_tab(products_df: pd.DataFrame) -> None:
             st.success(f"商品を登録しました: {new_name.strip()}")
             st.rerun()
 
-    st.markdown("#### 現在の商品一覧")
     view_df = products_df.copy()
     view_df["状態"] = np.where(view_df["is_active"] == 1, "販売中", "販売終了")
     st.dataframe(view_df[["product_id", "name", "unit_price", "状態"]], use_container_width=True, hide_index=True)
 
     active_df = products_df[products_df["is_active"] == 1]
     inactive_df = products_df[products_df["is_active"] == 0]
-
     c1, c2 = st.columns(2)
     with c1:
         if not active_df.empty:
-            selected_off = st.selectbox(
-                "販売終了にする商品",
-                active_df["product_id"] + " | " + active_df["name"],
-                key="deactivate_select",
-            )
+            selected_off = st.selectbox("販売終了", active_df["product_id"] + " | " + active_df["name"], key="deactivate_select")
             if st.button("販売終了にする", use_container_width=True):
-                pid = selected_off.split(" | ")[0]
-                deactivate_product(pid)
-                st.success("商品を販売終了にしました。")
+                deactivate_product(selected_off.split(" | ")[0])
                 st.rerun()
-
     with c2:
         if not inactive_df.empty:
-            selected_on = st.selectbox(
-                "販売再開する商品",
-                inactive_df["product_id"] + " | " + inactive_df["name"],
-                key="activate_select",
-            )
+            selected_on = st.selectbox("販売再開", inactive_df["product_id"] + " | " + inactive_df["name"], key="activate_select")
             if st.button("販売再開する", use_container_width=True):
-                pid = selected_on.split(" | ")[0]
-                activate_product(pid)
-                st.success("商品を販売再開しました。")
+                activate_product(selected_on.split(" | ")[0])
                 st.rerun()
 
 
 def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> None:
     st.markdown('<p class="section-title">ダッシュボード・可視化</p>', unsafe_allow_html=True)
     if daily_df.empty:
-        st.warning("営業データがありません。先に「データ入力」タブで保存してください。")
+        st.warning("営業データがありません。Square CSVをアップロードしてください。")
         return
 
     daily_df = daily_df.sort_values("date")
     day_totals = get_day_totals(daily_df)
     latest_date = day_totals["date"].max().date()
 
-    product_options = products_df["name"].tolist()
-    selected_name = st.selectbox("対象フード商品", product_options, key="dashboard_product")
+    selected_name = st.selectbox("対象フード商品", products_df["name"].tolist(), key="dashboard_product")
     selected = products_df[products_df["name"] == selected_name].iloc[0]
     product_id = selected["product_id"]
     unit_price = int(selected["unit_price"])
 
-    product_df = daily_df[daily_df["product_id"] == product_id].copy()
+    product_df = daily_df[daily_df["product_id"] == product_id]
     latest_row = product_df[product_df["date"] == to_ts(latest_date)]
     latest_units = int(latest_row["units_sold"].iloc[0]) if not latest_row.empty else 0
     single_revenue = latest_units * unit_price
@@ -618,12 +727,9 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
 
     st.markdown('<p class="section-title">発注予測シミュレーター</p>', unsafe_allow_html=True)
     fc1, fc2, fc3 = st.columns(3)
-    with fc1:
-        predicted_customers = st.number_input("予測客数（または目標客数）", min_value=100, max_value=6000, value=2400, step=50)
-    with fc2:
-        correction_pct = st.slider("天気・イベント補正（%）", min_value=-30, max_value=50, value=0)
-    with fc3:
-        current_stock = st.number_input("現在の在庫数（個）", min_value=0, max_value=5000, value=120, step=5)
+    predicted_customers = fc1.number_input("予測客数", min_value=100, max_value=6000, value=2400, step=50)
+    correction_pct = fc2.slider("天気・イベント補正（%）", -30, 50, 0)
+    current_stock = fc3.number_input("現在の在庫数（個）", min_value=0, max_value=5000, value=120, step=5)
 
     correction_factor = 1.0 + correction_pct / 100.0
     recommended = max(0, int(round(predicted_customers * selection_rate * correction_factor - current_stock)))
@@ -644,14 +750,11 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
     )
 
     if recommended > COLD_STORAGE_CAPACITY:
-        st.error(
-            f"⚠️ 推奨発注量（{recommended:,} 個）が限界収容量（{COLD_STORAGE_CAPACITY:,} 個）を "
-            f"{recommended - COLD_STORAGE_CAPACITY:,} 個超えています。"
-        )
+        st.error(f"推奨発注量が限界収容量（{COLD_STORAGE_CAPACITY:,} 個）を超えています。")
     elif recommended > COLD_STORAGE_CAPACITY * 0.85:
-        st.warning("収容量の85%を超えています。保管スペースと欠品リスクを再確認してください。")
+        st.warning("収容量の85%を超えています。")
     else:
-        st.success("収容量内の推奨発注量です。")
+        st.success("収容容量内の推奨発注量です。")
 
 
 def main() -> None:
@@ -666,15 +769,17 @@ def main() -> None:
         f"""
         <div class="main-title">
             <h1>🍽️ {APP_TITLE}</h1>
-            <p>手動入力データ蓄積型（CSV保存） · 日商目安 ¥{DAILY_REVENUE_TARGET:,}+</p>
+            <p>Square CSV取り込み + 手動修正 · 日商目安 ¥{DAILY_REVENUE_TARGET:,}+</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    t1, t2, t3, t4 = st.tabs(["データ入力", "過去データ確認・修正", "商品管理", "ダッシュボード・可視化"])
+    t1, t2, t3, t4 = st.tabs(
+        ["Square CSVアップロード", "過去データ確認・修正", "商品管理", "ダッシュボード・可視化"]
+    )
     with t1:
-        render_data_input_tab(products_df)
+        render_square_upload_tab(products_df, daily_df)
     with t2:
         render_history_edit_tab(products_df, daily_df)
     with t3:
