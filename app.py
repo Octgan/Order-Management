@@ -55,15 +55,62 @@ DAILY_SALES_COLUMNS = [
     "created_at",
 ]
 
-# Square CSV 列名の候補（日本語・英語）
+# Square CSV 列名の候補（日本語・英語）— 優先度順
 COLUMN_ALIASES: dict[str, list[str]] = {
-    "date": ["date", "日付", "取引日", "営業日", "day", "売上日"],
-    "item": ["item", "item name", "商品名", "品目", "メニュー", "商品", "アイテム"],
-    "quantity": ["qty", "quantity", "数量", "販売数", "個数", "sold", "販売個数"],
-    "net_sales": ["net sales", "ネット売上", "純売上", "net"],
-    "gross_sales": ["gross sales", "総売上", "売上", "gross", "売上高"],
-    "customers": ["customers", "客数", "来店客数", "取引数", "transactions", "transaction count", "総客数"],
-    "total_sales": ["total sales", "店舗売上", "総売上高", "売上合計", "店舗総売上"],
+    "date": [
+        "date",
+        "日付",
+        "時期",
+        "取引日",
+        "取引日時",
+        "営業日",
+        "day",
+        "売上日",
+        "datetime",
+        "date time",
+        "期間",
+        "レポート期間",
+    ],
+    "time": ["time", "時刻", "取引時刻", "時間"],
+    "item": [
+        "item",
+        "item name",
+        "商品名",
+        "アイテム名",
+        "アイテム",
+        "品目",
+        "品名",
+        "メニュー",
+        "商品",
+        "メニュー名",
+        "items",
+    ],
+    "quantity": [
+        "qty",
+        "quantity",
+        "数量",
+        "販売数",
+        "個数",
+        "sold",
+        "販売個数",
+        "販売数量",
+        "items sold",
+        "売上数量",
+        "点数",
+    ],
+    "net_sales": ["net sales", "ネット売上", "純売上", "net", "正味売上", "売上（税込）"],
+    "gross_sales": ["gross sales", "総売上", "売上", "gross", "売上高", "総売上高"],
+    "customers": [
+        "customers",
+        "客数",
+        "来店客数",
+        "取引数",
+        "transactions",
+        "transaction count",
+        "総客数",
+        "取引件数",
+    ],
+    "total_sales": ["total sales", "店舗売上", "総売上高", "売上合計", "店舗総売上", "合計売上"],
 }
 
 
@@ -140,19 +187,92 @@ def clear_all_daily_sales() -> None:
 
 
 def normalize_col(name: str) -> str:
-    return re.sub(r"\s+", " ", str(name).strip().lower())
+    s = str(name).replace("\ufeff", "").strip().lower()
+    return re.sub(r"\s+", " ", s)
 
 
 def find_column(columns: list[str], keys: list[str]) -> str | None:
-    normalized = {normalize_col(c): c for c in columns}
-    for key in keys:
-        if key in normalized:
-            return normalized[key]
-    for col_norm, original in normalized.items():
-        for key in keys:
-            if key in col_norm or col_norm in key:
-                return original
-    return None
+    """列名をあいまいマッチング（完全一致を最優先）。"""
+    candidates: list[tuple[int, str]] = []
+    for original in columns:
+        col_norm = normalize_col(original)
+        if not col_norm or col_norm == "nan":
+            continue
+        for priority, key in enumerate(keys):
+            score = 0
+            if col_norm == key:
+                score = 1000 - priority
+            elif col_norm.startswith(key) or key.startswith(col_norm):
+                score = 800 - priority
+            elif key in col_norm:
+                score = 600 - priority
+            elif col_norm in key:
+                score = 500 - priority
+            if score > 0:
+                candidates.append((score, original))
+                break
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+
+def detect_column_mapping(columns: list[str]) -> dict[str, str | None]:
+    return {key: find_column(columns, aliases) for key, aliases in COLUMN_ALIASES.items()}
+
+
+def prepare_square_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Square CSVの先頭メタ行をスキップし、ヘッダー行を自動検出する。"""
+    if df.empty:
+        return df
+
+    cols = [str(c) for c in df.columns]
+    if find_column(cols, COLUMN_ALIASES["date"]):
+        out = df.copy()
+        out.columns = [str(c).strip() for c in out.columns]
+        return out
+
+    # 先頭数行のどこかにヘッダーがあるパターン（Squareレポートで多い）
+    scan_limit = min(25, len(df))
+    for idx in range(scan_limit):
+        row_vals = [str(v).strip() for v in df.iloc[idx].tolist()]
+        if find_column(row_vals, COLUMN_ALIASES["date"]):
+            headers = [str(v).strip() for v in df.iloc[idx].tolist()]
+            body = df.iloc[idx + 1 :].copy()
+            body.columns = headers
+            body = body.reset_index(drop=True)
+            body.columns = [str(c).strip() for c in body.columns]
+            keep_cols = [c for c in body.columns if str(c).strip()]
+            return body[keep_cols]
+
+    # Unnamed列のみの場合は1行目をヘッダーとして再構成
+    if all(re.match(r"unnamed: \d+", normalize_col(c)) or str(c).isdigit() for c in cols):
+        headers = [str(v).strip() for v in df.iloc[0].tolist()]
+        body = df.iloc[1:].copy()
+        body.columns = headers
+        body = body.reset_index(drop=True)
+        body.columns = [str(c).strip() for c in body.columns]
+        return body
+
+    return df
+
+
+def build_datetime_series(work: pd.DataFrame, date_col: str, time_col: str | None) -> pd.Series:
+    if time_col and time_col in work.columns:
+        combined = work[date_col].astype(str).str.strip() + " " + work[time_col].astype(str).str.strip()
+        return pd.to_datetime(combined, format="mixed", errors="coerce")
+    return pd.to_datetime(work[date_col], format="mixed", errors="coerce")
+
+
+def show_csv_debug_panel(raw_df: pd.DataFrame, mapping: dict[str, str | None] | None = None) -> None:
+    with st.expander("📋 CSVヘッダー・先頭データ（デバッグ）", expanded=True):
+        st.markdown("**CSVに含まれる列名（ヘッダー）**")
+        st.code("\n".join(f"- {c}" for c in raw_df.columns.astype(str).tolist()), language="text")
+        if mapping:
+            st.markdown("**自動判別結果**")
+            st.json({k: (v or "（未検出）") for k, v in mapping.items()})
+        st.markdown("**先頭8行のデータ**")
+        st.dataframe(raw_df.head(8), use_container_width=True)
 
 
 def read_uploaded_csv(uploaded_file: Any) -> pd.DataFrame:
@@ -160,11 +280,26 @@ def read_uploaded_csv(uploaded_file: Any) -> pd.DataFrame:
     read_kwargs: dict[str, Any] = {"on_bad_lines": "skip"}
     for enc in ("utf-8-sig", "utf-8", "cp932", "shift_jis"):
         try:
-            return pd.read_csv(io.BytesIO(raw), encoding=enc, **read_kwargs)
+            df = pd.read_csv(io.BytesIO(raw), encoding=enc, **read_kwargs)
+            return prepare_square_dataframe(df)
         except UnicodeDecodeError:
             continue
     text = raw.decode("utf-8", errors="replace")
-    return pd.read_csv(io.StringIO(text), **read_kwargs)
+    df = pd.read_csv(io.StringIO(text), **read_kwargs)
+    return prepare_square_dataframe(df)
+
+
+def read_uploaded_csv_raw(uploaded_file: Any) -> pd.DataFrame:
+    """ヘッダー自動検出前の生データ（デバッグ表示用）。"""
+    raw = uploaded_file.getvalue()
+    read_kwargs: dict[str, Any] = {"on_bad_lines": "skip"}
+    for enc in ("utf-8-sig", "utf-8", "cp932", "shift_jis"):
+        try:
+            return pd.read_csv(io.BytesIO(raw), encoding=enc, header=None, **read_kwargs)
+        except UnicodeDecodeError:
+            continue
+    text = raw.decode("utf-8", errors="replace")
+    return pd.read_csv(io.StringIO(text), header=None, **read_kwargs)
 
 
 def match_product_name(raw_name: str, product_names: list[str]) -> str | None:
@@ -185,18 +320,24 @@ def match_product_name(raw_name: str, product_names: list[str]) -> str | None:
 def parse_square_csv(df: pd.DataFrame, products_df: pd.DataFrame) -> tuple[list[DayImport], list[str]]:
     """SquareエクスポートCSVを日次データへ変換する。"""
     warnings: list[str] = []
-    cols = df.columns.astype(str).tolist()
+    df = prepare_square_dataframe(df)
+    cols = [str(c) for c in df.columns.tolist()]
     product_names = products_df["name"].astype(str).tolist()
 
     date_col = find_column(cols, COLUMN_ALIASES["date"])
     if not date_col:
-        raise ValueError("日付列が見つかりません。CSVの列名をご確認ください。")
+        raise ValueError(
+            "日付列が見つかりません。CSVの列名をご確認ください。"
+            "（対応例: 日付 / 時期 / Date / 取引日時）"
+        )
 
     work = df.copy()
-    work[date_col] = pd.to_datetime(work[date_col], format="mixed", errors="coerce")
-    work = work.dropna(subset=[date_col])
+    time_col = find_column(cols, COLUMN_ALIASES["time"])
+    work["_parsed_date"] = build_datetime_series(work, date_col, time_col)
+    work = work.dropna(subset=["_parsed_date"])
     if work.empty:
         raise ValueError("有効な日付データがありません。")
+    work["_day"] = work["_parsed_date"].dt.date
 
     item_col = find_column(cols, COLUMN_ALIASES["item"])
     qty_col = find_column(cols, COLUMN_ALIASES["quantity"])
@@ -210,7 +351,7 @@ def parse_square_csv(df: pd.DataFrame, products_df: pd.DataFrame) -> tuple[list[
     imports: list[DayImport] = []
 
     if wide_product_cols and not item_col:
-        for day_val, group in work.groupby(work[date_col].dt.date):
+        for day_val, group in work.groupby("_day"):
             units: dict[str, int] = {}
             for col in wide_product_cols:
                 matched = match_product_name(col, product_names)
@@ -240,7 +381,7 @@ def parse_square_csv(df: pd.DataFrame, products_df: pd.DataFrame) -> tuple[list[
         )
 
     sales_col = net_sales_col or gross_sales_col
-    for day_val, group in work.groupby(work[date_col].dt.date):
+    for day_val, group in work.groupby("_day"):
         units: dict[str, int] = {}
         unmapped: list[str] = []
         for _, row in group.iterrows():
@@ -535,6 +676,7 @@ def render_square_upload_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) 
 
     uploaded = st.file_uploader("Square売上CSVファイル", type=["csv"], accept_multiple_files=False)
     overwrite = st.checkbox("既存日付のデータは上書きする", value=True)
+    show_debug = st.checkbox("CSVヘッダーを確認（デバッグ）", value=False)
 
     if uploaded is None:
         if is_daily_data_empty(daily_df):
@@ -548,13 +690,19 @@ def render_square_upload_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) 
             st.info("CSVをアップロードすると、取り込みプレビューが表示されます。")
         return
 
+    raw_for_debug = read_uploaded_csv_raw(uploaded)
+    prepared_df = prepare_square_dataframe(raw_for_debug.copy())
+    mapping = detect_column_mapping([str(c) for c in prepared_df.columns.tolist()])
+
+    if show_debug:
+        show_csv_debug_panel(prepared_df, mapping)
+
     try:
         raw_df = read_uploaded_csv(uploaded)
         imports, warnings = parse_square_csv(raw_df, products_df)
     except Exception as exc:
         st.error(f"CSVの読み込みに失敗しました: {exc}")
-        with st.expander("CSVの先頭行を確認"):
-            st.dataframe(raw_df.head(20), use_container_width=True)
+        show_csv_debug_panel(prepared_df, mapping)
         return
 
     if not imports:
