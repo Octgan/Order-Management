@@ -42,17 +42,18 @@ DEFAULT_PRODUCTS: list[dict[str, Any]] = [
     {"name": "季節のソースとグラノーラ", "unit_price": 980},
 ]
 
-BASE_QTY_BY_NAME: dict[str, int] = {
-    "ワッフル": 220,
-    "パフェ": 170,
-    "チーズケーキ": 185,
-    "抹茶チーズケーキ": 150,
-    "バナナパウンドケーキ": 120,
-    "レモンパウンドケーキ": 110,
-    "グラノーラ": 95,
-    "オーバーナイトグラノーラ": 85,
-    "季節のソースとグラノーラ": 105,
-}
+EMPTY_DATA_MESSAGE = "データがありません。SquareのCSVファイルをアップロードしてください。"
+
+DAILY_SALES_COLUMNS = [
+    "date",
+    "total_sales",
+    "total_customers",
+    "product_id",
+    "product_name",
+    "unit_price",
+    "units_sold",
+    "created_at",
+]
 
 # Square CSV 列名の候補（日本語・英語）
 COLUMN_ALIASES: dict[str, list[str]] = {
@@ -94,6 +95,11 @@ def inject_css() -> None:
             font-size: 1.05rem; font-weight: 700; margin: 1.2rem 0 .8rem;
             border-left: 4px solid #e94560; padding-left: .6rem;
         }
+        .empty-state-box {
+            background: #fff8e6; border: 1px solid #f0d78c; border-radius: 10px;
+            padding: 1rem 1.2rem; margin-bottom: 1rem; color: #5a4a1a;
+        }
+        .empty-state-box strong { color: #1a1a2e; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -102,6 +108,35 @@ def inject_css() -> None:
 
 def to_ts(d: date) -> pd.Timestamp:
     return pd.Timestamp(d)
+
+
+def is_daily_data_empty(daily_df: pd.DataFrame | None = None) -> bool:
+    if daily_df is None:
+        daily_df = load_daily_sales()
+    return daily_df.empty
+
+
+def show_empty_data_notice() -> None:
+    st.markdown(
+        f"""
+        <div class="empty-state-box">
+            <strong>📂 {EMPTY_DATA_MESSAGE}</strong><br>
+            「Square CSVアップロード」タブから、Squareダッシュボードでエクスポートした売上CSVを取り込んでください。
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def init_empty_daily_csv() -> None:
+    """営業データCSVをヘッダーのみの空状態にする。"""
+    pd.DataFrame(columns=DAILY_SALES_COLUMNS).to_csv(DAILY_CSV, index=False, encoding="utf-8-sig")
+
+
+def clear_all_daily_sales() -> None:
+    """デモ・過去の営業データをすべて削除する。"""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    init_empty_daily_csv()
 
 
 def normalize_col(name: str) -> str:
@@ -257,20 +292,8 @@ def ensure_data_files() -> None:
         ]
         pd.DataFrame(rows).to_csv(PRODUCTS_CSV, index=False, encoding="utf-8-sig")
 
-    if not DAILY_CSV.exists() or DAILY_CSV.stat().st_size == 0:
-        pd.DataFrame(
-            columns=[
-                "date",
-                "total_sales",
-                "total_customers",
-                "product_id",
-                "product_name",
-                "unit_price",
-                "units_sold",
-                "created_at",
-            ]
-        ).to_csv(DAILY_CSV, index=False, encoding="utf-8-sig")
-        seed_initial_data(days=35, seed=42)
+    if not DAILY_CSV.exists():
+        init_empty_daily_csv()
 
 
 def load_products() -> pd.DataFrame:
@@ -430,31 +453,6 @@ def activate_product(product_id: str) -> None:
     products_df.to_csv(PRODUCTS_CSV, index=False, encoding="utf-8-sig")
 
 
-def seed_initial_data(days: int = 35, seed: int = 42) -> None:
-    rng = np.random.default_rng(seed)
-    products_df = load_products()
-    daily_df = load_daily_sales()
-    existing_dates = set(daily_df["date"].dt.date.tolist()) if not daily_df.empty else set()
-
-    for d_offset in range(days, -1, -1):
-        d = date.today() - timedelta(days=d_offset)
-        if d in existing_dates:
-            continue
-        weekday = d.weekday()
-        day_factor = 1.0 + (0.22 if weekday >= 4 else 0.0) + (0.07 if weekday == 5 else 0.10 if weekday == 6 else 0.0)
-        noise = float(rng.normal(1.0, 0.07))
-        total_customers = int(1900 * day_factor * noise)
-        units_by_product: dict[str, int] = {}
-        calc_food_sales = 0
-        for _, p in products_df.iterrows():
-            base = BASE_QTY_BY_NAME.get(str(p["name"]), 85)
-            units = max(25, int(base * day_factor * noise * float(rng.uniform(0.90, 1.12))))
-            units_by_product[str(p["name"])] = units
-            calc_food_sales += units * int(p["unit_price"])
-        beverage_sales = int(total_customers * float(rng.uniform(290, 360)))
-        save_daily_input(d, int(calc_food_sales + beverage_sales), total_customers, units_by_product, products_df)
-
-
 # ---------------------------------------------------------------------------
 # 分析・グラフ
 # ---------------------------------------------------------------------------
@@ -537,7 +535,15 @@ def render_square_upload_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) 
     overwrite = st.checkbox("既存日付のデータは上書きする", value=True)
 
     if uploaded is None:
-        st.info("CSVをアップロードすると、取り込みプレビューが表示されます。")
+        if is_daily_data_empty(daily_df):
+            st.info(EMPTY_DATA_MESSAGE)
+            st.markdown(
+                "1. Squareダッシュボードで売上レポートをCSVエクスポート  \n"
+                "2. 上のエリアにファイルをドラッグ＆ドロップ  \n"
+                "3. プレビュー確認後、「データを一括取り込み」をクリック"
+            )
+        else:
+            st.info("CSVをアップロードすると、取り込みプレビューが表示されます。")
         return
 
     try:
@@ -612,7 +618,7 @@ def render_history_edit_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -
                 st.rerun()
 
     if daily_df.empty:
-        st.info("まだ営業データがありません。先に「Square CSVアップロード」から取り込んでください。")
+        st.warning(EMPTY_DATA_MESSAGE)
         return
 
     st.dataframe(make_daily_summary_table(daily_df), use_container_width=True, hide_index=True)
@@ -686,7 +692,7 @@ def render_product_tab(products_df: pd.DataFrame) -> None:
 def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> None:
     st.markdown('<p class="section-title">ダッシュボード・可視化</p>', unsafe_allow_html=True)
     if daily_df.empty:
-        st.warning("営業データがありません。Square CSVをアップロードしてください。")
+        st.warning(EMPTY_DATA_MESSAGE)
         return
 
     daily_df = daily_df.sort_values("date")
@@ -774,6 +780,9 @@ def main() -> None:
         """,
         unsafe_allow_html=True,
     )
+
+    if is_daily_data_empty(daily_df):
+        show_empty_data_notice()
 
     t1, t2, t3, t4 = st.tabs(
         ["Square CSVアップロード", "過去データ確認・修正", "商品管理", "ダッシュボード・可視化"]
