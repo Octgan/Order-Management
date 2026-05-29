@@ -120,6 +120,16 @@ class DayImport:
     units_by_product: dict[str, int]
 
 
+@dataclass
+class DaySummary:
+    total_sales: int
+    total_customers: int
+
+
+SUMMARY_CUSTOMER_ROW_KEYWORDS = ["取引", "transaction", "客数", "注文件数", "件数"]
+SUMMARY_SALES_ROW_KEYWORDS = ["売上", "sales", "gross", "net", "収入", "合計金額"]
+
+
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
@@ -305,16 +315,39 @@ def matrix_to_long_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return long_df[["date", "product_name", "quantity"]]
 
 
-def parse_matrix_format(df: pd.DataFrame, products_df: pd.DataFrame) -> tuple[list[DayImport], list[str]]:
-    """横持ちマトリックス（日付=列、商品=行）を日次データへ変換。"""
-    warnings: list[str] = ["マトリックス形式CSVを検出しました（日付が横方向）。"]
-    long_df = matrix_to_long_dataframe(df)
+def is_customer_metric_label(label: str) -> bool:
+    text = str(label).strip().lower()
+    if not text or is_summary_row_label(label):
+        return False
+    if any(k in text for k in SUMMARY_SALES_ROW_KEYWORDS) and "取引" not in text:
+        return False
+    return any(k in text for k in SUMMARY_CUSTOMER_ROW_KEYWORDS)
+
+
+def is_sales_metric_label(label: str) -> bool:
+    text = str(label).strip().lower()
+    if not text or is_summary_row_label(label):
+        return False
+    if is_customer_metric_label(label):
+        return False
+    return any(k in text for k in SUMMARY_SALES_ROW_KEYWORDS)
+
+
+def parse_matrix_units_by_day(
+    df: pd.DataFrame, products_df: pd.DataFrame
+) -> tuple[dict[date, dict[str, int]], list[str]]:
+    """商品別マトリックスCSVから日別・商品別販売数のみ抽出。"""
+    warnings: list[str] = ["商品別マトリックスCSVを読み込みました。"]
+    prepared = prepare_square_dataframe(df)
+    if not is_matrix_format_df(prepared):
+        raise ValueError("商品別CSVはマトリックス形式（日付が横方向）である必要があります。")
+
+    long_df = matrix_to_long_dataframe(prepared)
     if long_df.empty:
-        raise ValueError("マトリックス形式CSVから有効な販売データを抽出できませんでした。")
+        raise ValueError("商品別マトリックスCSVから販売データを抽出できませんでした。")
 
     product_names = products_df["name"].astype(str).tolist()
-    price_map = dict(zip(products_df["name"], products_df["unit_price"]))
-    imports: list[DayImport] = []
+    units_by_day: dict[date, dict[str, int]] = {}
 
     for day_val, day_group in long_df.groupby("date"):
         units = {name: 0 for name in product_names}
@@ -325,17 +358,230 @@ def parse_matrix_format(df: pd.DataFrame, products_df: pd.DataFrame) -> tuple[li
                 unmapped.append(str(row["product_name"]))
                 continue
             units[matched] = units.get(matched, 0) + int(row["quantity"])
-
         if unmapped:
             sample = ", ".join(sorted(set(unmapped))[:5])
             warnings.append(f"{day_val}: 未登録商品をスキップ（例: {sample}）")
+        units_by_day[day_val] = units
 
+    return units_by_day, warnings
+
+
+def parse_sales_summary_vertical(df: pd.DataFrame) -> tuple[dict[date, DaySummary], list[str]]:
+    """売上サマリー（縦持ち・日付列あり）から日別の総売上・総客数を抽出。"""
+    warnings: list[str] = ["売上サマリーCSV（縦持ち）を読み込みました。"]
+    prepared = prepare_square_dataframe(df)
+    cols = [str(c) for c in prepared.columns.tolist()]
+
+    date_col = find_column(cols, COLUMN_ALIASES["date"])
+    if not date_col:
+        raise ValueError("売上サマリーCSVに日付列が見つかりません。")
+
+    customers_col = find_column(cols, COLUMN_ALIASES["customers"])
+    total_sales_col = find_column(cols, COLUMN_ALIASES["total_sales"])
+    net_sales_col = find_column(cols, COLUMN_ALIASES["net_sales"])
+    gross_sales_col = find_column(cols, COLUMN_ALIASES["gross_sales"])
+    sales_col = total_sales_col or gross_sales_col or net_sales_col
+
+    work = prepared.copy()
+    work["_parsed_date"] = build_datetime_series(work, date_col, find_column(cols, COLUMN_ALIASES["time"]))
+    work = work.dropna(subset=["_parsed_date"])
+    work["_day"] = work["_parsed_date"].dt.date
+
+    by_day: dict[date, DaySummary] = {}
+    for day_val, group in work.groupby("_day"):
+        customers = 0
+        if customers_col:
+            customers = int(pd.to_numeric(group[customers_col], errors="coerce").fillna(0).max())
+        sales = 0
+        if sales_col:
+            sales = int(pd.to_numeric(group[sales_col], errors="coerce").fillna(0).max())
+        if customers == 0 and sales == 0:
+            continue
+        by_day[day_val] = DaySummary(total_sales=sales, total_customers=customers)
+
+    if not by_day:
+        raise ValueError("売上サマリーCSVから有効な日次データを抽出できませんでした。")
+    return by_day, warnings
+
+
+def parse_sales_summary_matrix(df: pd.DataFrame) -> tuple[dict[date, DaySummary], list[str]]:
+    """売上サマリー（指標が行・日付が列のマトリックス）から抽出。"""
+    warnings: list[str] = ["売上サマリーCSV（マトリックス形式）を読み込みました。"]
+    prepared = prepare_square_dataframe(df)
+    if not is_matrix_format_df(prepared):
+        raise ValueError("売上サマリーCSVの形式を認識できませんでした。")
+
+    item_col = find_matrix_item_column([str(c) for c in prepared.columns])
+    date_cols = get_matrix_date_columns([str(c) for c in prepared.columns])
+    if not item_col or not date_cols:
+        raise ValueError("売上サマリーCSVの列構成を認識できませんでした。")
+
+    by_day: dict[date, DaySummary] = {dcol_date: DaySummary(0, 0) for dcol in date_cols if (dcol_date := parse_column_as_date(dcol))}
+
+    for _, row in prepared.iterrows():
+        label = str(row[item_col]).strip()
+        if not label or is_summary_row_label(label):
+            continue
+        for dcol in date_cols:
+            day_val = parse_column_as_date(dcol)
+            if not day_val:
+                continue
+            val = int(pd.to_numeric(row[dcol], errors="coerce") or 0)
+            current = by_day.setdefault(day_val, DaySummary(0, 0))
+            if is_customer_metric_label(label):
+                by_day[day_val] = DaySummary(current.total_sales, max(current.total_customers, val))
+            elif is_sales_metric_label(label):
+                by_day[day_val] = DaySummary(max(current.total_sales, val), current.total_customers)
+
+    by_day = {d: s for d, s in by_day.items() if s.total_sales > 0 or s.total_customers > 0}
+    if not by_day:
+        raise ValueError("売上サマリーCSVから総売上・取引件数を抽出できませんでした。")
+    return by_day, warnings
+
+
+def parse_sales_summary_csv(df: pd.DataFrame) -> tuple[dict[date, DaySummary], list[str]]:
+    prepared = prepare_square_dataframe(df)
+    if is_matrix_format_df(prepared):
+        item_col = find_matrix_item_column([str(c) for c in prepared.columns])
+        if item_col:
+            has_metric_row = any(
+                is_customer_metric_label(str(row[item_col])) or is_sales_metric_label(str(row[item_col]))
+                for _, row in prepared.iterrows()
+            )
+            if has_metric_row:
+                return parse_sales_summary_matrix(prepared)
+    return parse_sales_summary_vertical(prepared)
+
+
+def classify_uploaded_csv(df: pd.DataFrame, products_df: pd.DataFrame) -> str:
+    """product_matrix / sales_summary / unknown"""
+    prepared = prepare_square_dataframe(df)
+    product_names = products_df["name"].astype(str).tolist()
+
+    if is_matrix_format_df(prepared):
+        item_col = find_matrix_item_column([str(c) for c in prepared.columns])
+        if not item_col:
+            return "unknown"
+        product_rows = 0
+        metric_rows = 0
+        for _, row in prepared.iterrows():
+            label = str(row[item_col]).strip()
+            if not label or is_summary_row_label(label):
+                continue
+            if match_product_name(label, product_names):
+                product_rows += 1
+            elif is_customer_metric_label(label) or is_sales_metric_label(label):
+                metric_rows += 1
+        if product_rows > 0 and product_rows >= metric_rows:
+            return "product_matrix"
+        if metric_rows > 0:
+            return "sales_summary"
+        return "product_matrix"
+
+    cols = [str(c) for c in prepared.columns]
+    date_col = find_column(cols, COLUMN_ALIASES["date"])
+    sales_col = (
+        find_column(cols, COLUMN_ALIASES["total_sales"])
+        or find_column(cols, COLUMN_ALIASES["gross_sales"])
+        or find_column(cols, COLUMN_ALIASES["net_sales"])
+    )
+    customers_col = find_column(cols, COLUMN_ALIASES["customers"])
+    if date_col and (sales_col or customers_col):
+        return "sales_summary"
+    if date_col and find_column(cols, COLUMN_ALIASES["item"]) and find_column(cols, COLUMN_ALIASES["quantity"]):
+        return "product_matrix"
+    return "unknown"
+
+
+def merge_dual_csv_imports(
+    units_by_day: dict[date, dict[str, int]],
+    summary_by_day: dict[date, DaySummary],
+    products_df: pd.DataFrame,
+) -> tuple[list[DayImport], list[str]]:
+    """商品別データと売上サマリーを日付キーで結合。"""
+    warnings: list[str] = ["ルートB: 2枚のCSVを日付で結合しました。"]
+    product_names = products_df["name"].astype(str).tolist()
+    price_map = dict(zip(products_df["name"], products_df["unit_price"]))
+    all_days = sorted(set(units_by_day) | set(summary_by_day))
+
+    if not all_days:
+        raise ValueError("結合できる日付データがありません。")
+
+    only_products = set(units_by_day) - set(summary_by_day)
+    only_summary = set(summary_by_day) - set(units_by_day)
+    if only_products:
+        warnings.append(f"売上サマリーに無い日付: {len(only_products)}日（販売数のみ反映・客数/売上は推定）。")
+    if only_summary:
+        warnings.append(f"商品別CSVに無い日付: {len(only_summary)}日（客数/売上のみ反映）。")
+
+    imports: list[DayImport] = []
+    for day_val in all_days:
+        units = units_by_day.get(day_val, {name: 0 for name in product_names})
+        summary = summary_by_day.get(day_val)
+
+        if summary:
+            total_sales = int(summary.total_sales)
+            total_customers = int(summary.total_customers)
+        else:
+            total_sales = int(sum(units.get(n, 0) * int(price_map.get(n, 0)) for n in product_names))
+            total_customers = max(100, int(sum(units.values()) / 0.12)) if sum(units.values()) > 0 else 0
+
+        if not summary or total_sales == 0:
+            est_sales = int(sum(units.get(n, 0) * int(price_map.get(n, 0)) for n in product_names))
+            if total_sales == 0 and est_sales > 0:
+                total_sales = est_sales
+        if not summary or total_customers == 0:
+            if sum(units.values()) > 0:
+                total_customers = max(total_customers, int(sum(units.values()) / 0.12))
+
+        imports.append(DayImport(day_val, total_sales, total_customers, units))
+
+    return imports, warnings
+
+
+def parse_dual_csv_upload(
+    uploaded_files: list[Any], products_df: pd.DataFrame
+) -> tuple[list[DayImport], list[str]]:
+    """最大2枚: 商品別マトリックス + 売上サマリーを結合。"""
+    if len(uploaded_files) > 2:
+        raise ValueError("アップロードは2ファイルまでです。")
+
+    classified: list[tuple[str, Any, pd.DataFrame, str]] = []
+    for f in uploaded_files:
+        df = read_uploaded_csv(f)
+        kind = classify_uploaded_csv(df, products_df)
+        classified.append((f.name, f, df, kind))
+
+    if len(classified) == 1:
+        return parse_square_csv(classified[0][2], products_df)
+
+    product_file = next((x for x in classified if x[3] == "product_matrix"), None)
+    summary_file = next((x for x in classified if x[3] == "sales_summary"), None)
+
+    if not product_file or not summary_file:
+        kinds = ", ".join(f"{x[0]}→{x[3]}" for x in classified)
+        raise ValueError(
+            "2枚の内訳を認識できませんでした。商品別マトリックスCSVと売上サマリーCSVをアップロードしてください。"
+            f"（判定: {kinds}）"
+        )
+
+    units_by_day, w1 = parse_matrix_units_by_day(product_file[2], products_df)
+    summary_by_day, w2 = parse_sales_summary_csv(summary_file[2])
+    imports, w3 = merge_dual_csv_imports(units_by_day, summary_by_day, products_df)
+    return imports, w1 + w2 + w3
+
+
+def parse_matrix_format(df: pd.DataFrame, products_df: pd.DataFrame) -> tuple[list[DayImport], list[str]]:
+    """横持ちマトリックス（日付=列、商品=行）を日次データへ変換（単体アップロード用）。"""
+    units_by_day, warnings = parse_matrix_units_by_day(df, products_df)
+    price_map = dict(zip(products_df["name"], products_df["unit_price"]))
+    product_names = products_df["name"].astype(str).tolist()
+    imports: list[DayImport] = []
+    for day_val, units in sorted(units_by_day.items()):
         day_sales = sum(units.get(n, 0) * int(price_map.get(n, 0)) for n in product_names)
-        total_units = sum(units.values())
-        customers = max(100, int(total_units / 0.12)) if total_units > 0 else 0
+        customers = max(100, int(sum(units.values()) / 0.12)) if sum(units.values()) > 0 else 0
         imports.append(DayImport(day_val, int(day_sales), customers, units))
-
-    warnings.append("総客数・店舗総売上は、商品販売数から推定しています（マトリックスCSVに客数・売上列なし）。")
+    warnings.append("総客数・店舗総売上は、商品販売数から推定しています（売上サマリーCSV未使用）。")
     return imports, warnings
 
 
@@ -793,38 +1039,59 @@ def plot_daily_trend(product_df: pd.DataFrame, product_name: str) -> go.Figure:
 # タブUI
 # ---------------------------------------------------------------------------
 def render_square_upload_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> None:
-    st.markdown('<p class="section-title">Square売上CSVアップロード</p>', unsafe_allow_html=True)
-    st.caption("Squareダッシュボードからエクスポートした売上CSVをドラッグ＆ドロップで取り込みます。")
+    st.markdown('<p class="section-title">Square売上CSVアップロード（ルートB）</p>', unsafe_allow_html=True)
+    st.caption(
+        "2枚のCSVを同時にアップロードしてください。"
+        " ①商品別マトリックス（日付=横・商品名=縦） ②売上サマリー（日別の総客数・店舗総売上）"
+    )
 
-    uploaded = st.file_uploader("Square売上CSVファイル", type=["csv"], accept_multiple_files=False)
+    uploaded_list = st.file_uploader(
+        "Square CSVファイル（最大2枚）",
+        type=["csv"],
+        accept_multiple_files=True,
+    )
     overwrite = st.checkbox("既存日付のデータは上書きする", value=True)
     show_debug = st.checkbox("CSVヘッダーを確認（デバッグ）", value=False)
 
-    if uploaded is None:
+    if not uploaded_list:
         if is_daily_data_empty(daily_df):
             st.info(EMPTY_DATA_MESSAGE)
             st.markdown(
-                "1. Squareダッシュボードで売上レポートをCSVエクスポート  \n"
-                "2. 上のエリアにファイルをドラッグ＆ドロップ  \n"
-                "3. プレビュー確認後、「データを一括取り込み」をクリック"
+                "1. **商品別**の横持ちCSV（ワッフル・パフェ等の日別販売数）  \n"
+                "2. **売上サマリー**のCSV（日別の総客数・店舗総売上）  \n"
+                "3. 2枚をまとめてドラッグ＆ドロップ → プレビュー確認 → 「データを一括取り込み」"
             )
         else:
             st.info("CSVをアップロードすると、取り込みプレビューが表示されます。")
         return
 
-    raw_for_debug = read_uploaded_csv_raw(uploaded)
-    prepared_df = prepare_square_dataframe(raw_for_debug.copy())
-    mapping = detect_column_mapping([str(c) for c in prepared_df.columns.tolist()])
+    files = uploaded_list if isinstance(uploaded_list, list) else [uploaded_list]
+    if len(files) > 2:
+        st.error("アップロードは2ファイルまでにしてください。")
+        return
+
+    st.markdown("#### アップロードされたファイル")
+    for f in files:
+        kind = classify_uploaded_csv(read_uploaded_csv(f), products_df)
+        label = {"product_matrix": "商品別マトリックス", "sales_summary": "売上サマリー", "unknown": "未判定"}.get(kind, kind)
+        st.write(f"- **{f.name}** → {label}")
 
     if show_debug:
-        show_csv_debug_panel(prepared_df, mapping)
+        for f in files:
+            st.markdown(f"**{f.name}**")
+            prepared_df = prepare_square_dataframe(read_uploaded_csv_raw(f).copy())
+            if not prepared_df.empty and not is_probable_header_row(list(prepared_df.columns.astype(str))):
+                prepared_df = prepare_square_dataframe(prepared_df)
+            mapping = detect_column_mapping([str(c) for c in prepared_df.columns.astype(str).tolist()])
+            show_csv_debug_panel(prepared_df, mapping)
 
     try:
-        raw_df = read_uploaded_csv(uploaded)
-        imports, warnings = parse_square_csv(raw_df, products_df)
+        imports, warnings = parse_dual_csv_upload(files, products_df)
     except Exception as exc:
         st.error(f"CSVの読み込みに失敗しました: {exc}")
-        show_csv_debug_panel(prepared_df, mapping)
+        if show_debug and files:
+            prepared_df = prepare_square_dataframe(read_uploaded_csv(files[0]))
+            show_csv_debug_panel(prepared_df, detect_column_mapping(list(prepared_df.columns.astype(str))))
         return
 
     if not imports:
