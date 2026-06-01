@@ -18,6 +18,7 @@ import streamlit as st
 
 from square_csv import (
     DayImport,
+    is_meaningful_day,
     load_uploaded_dataframe,
     parse_dual_csv_upload,
     summarize_square_row_mapping,
@@ -276,6 +277,36 @@ def list_recorded_dates(daily_df: pd.DataFrame) -> list[date]:
     if daily_df.empty:
         return []
     return sorted(daily_df["date"].dt.date.unique(), reverse=True)
+
+
+def purge_meaningless_days() -> int:
+    """販売0・売上/客数が極小の日を daily_sales から削除。戻り値=削除した日数。"""
+    daily_df = load_daily_sales()
+    if daily_df.empty:
+        return 0
+    removed = 0
+    keep_parts: list[pd.DataFrame] = []
+    for day_val, group in daily_df.groupby(daily_df["date"].dt.date):
+        units = dict(zip(group["product_name"].astype(str), group["units_sold"].astype(int)))
+        summary = None
+        if not group.empty:
+            from square_csv import DaySummary
+
+            summary = DaySummary(
+                int(group["total_sales"].iloc[0]),
+                int(group["total_customers"].iloc[0]),
+            )
+        if is_meaningful_day(units, summary):
+            keep_parts.append(group)
+        else:
+            removed += 1
+    if removed == 0:
+        return 0
+    if keep_parts:
+        pd.concat(keep_parts, ignore_index=True).to_csv(DAILY_CSV, index=False, encoding="utf-8-sig")
+    else:
+        init_empty_daily_csv()
+    return removed
 
 
 def bulk_import_days(imports: list[DayImport], products_df: pd.DataFrame, overwrite: bool = True) -> tuple[int, int]:
@@ -732,6 +763,13 @@ def main() -> None:
     with st.sidebar:
         st.markdown("### データ管理")
         st.caption(f"登録日数: **{len(list_recorded_dates(daily_df))}** 日")
+        if st.button("ゴミ日データを削除", type="secondary", use_container_width=True):
+            n = purge_meaningless_days()
+            if n:
+                st.success(f"販売ゼロ・極小の日を {n} 日分削除しました。")
+            else:
+                st.info("削除対象の日はありませんでした。")
+            st.rerun()
         if st.button("全データをリセット", type="secondary", use_container_width=True):
             reset_application_data()
             st.success("データを初期化しました。")

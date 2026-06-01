@@ -73,6 +73,10 @@ KV_SUMMARY_LABEL_HINTS = KV_CUSTOMER_METRIC_LABELS + KV_SALES_METRIC_LABELS + [
 SUMMARY_CUSTOMER_ROW_KEYWORDS = ["取引", "transaction", "客数", "件数"]
 SUMMARY_SALES_ROW_KEYWORDS = ["売上", "sales", "gross", "net", "収入", "合計金額"]
 
+# これ未満の日次は「実質データなし」とみなし取り込みしない（配分の端数などを除外）
+MIN_MEANINGFUL_DAY_SALES = 100
+MIN_MEANINGFUL_DAY_CUSTOMERS = 5
+
 
 @dataclass
 class DayImport:
@@ -86,6 +90,21 @@ class DayImport:
 class DaySummary:
     total_sales: int
     total_customers: int
+
+
+def is_meaningful_day(
+    units: dict[str, int],
+    summary: DaySummary | None = None,
+) -> bool:
+    """フード販売か店舗サマリーに実データがある日だけ残す。"""
+    if sum(units.values()) > 0:
+        return True
+    if not summary:
+        return False
+    return (
+        summary.total_sales >= MIN_MEANINGFUL_DAY_SALES
+        or summary.total_customers >= MIN_MEANINGFUL_DAY_CUSTOMERS
+    )
 
 
 def normalize_col(name: str) -> str:
@@ -455,14 +474,16 @@ def parse_matrix_units_by_day(
                 add_units = raw
                 day_revenue += raw * unit_price
             units[matched] = units.get(matched, 0) + add_units
-        units_by_day[day_val] = units
-        revenue_by_day[day_val] = max(day_revenue, 1.0) if sum(units.values()) > 0 else 0.0
+        if sum(units.values()) > 0 or day_revenue > 0:
+            units_by_day[day_val] = units
+            revenue_by_day[day_val] = max(day_revenue, 1.0)
 
     if used_yen:
         warnings.append("セルが金額（¥）表記のため、登録単価から販売数を換算しました。")
     if unmapped_labels:
         sample = "、".join(sorted(unmapped_labels)[:6])
         warnings.append(f"未紐づけのSquare行: {sample}（他{max(0, len(unmapped_labels) - 6)}件）")
+    warnings.append(f"商品別CSVから有効な営業日: {len(units_by_day)}日（販売ゼロのみの列は除外）")
     return units_by_day, revenue_by_day, warnings
 
 
@@ -662,6 +683,7 @@ def merge_dual_csv_imports(
     if only_summary:
         warnings.append(f"商品別CSVに無い日付: {len(only_summary)}日（客数/売上のみ）。")
     imports: list[DayImport] = []
+    skipped = 0
     for day_val in all_days:
         units = units_by_day.get(day_val, {name: 0 for name in product_names})
         summary = summary_by_day.get(day_val)
@@ -678,7 +700,17 @@ def merge_dual_csv_imports(
         if not summary or total_customers == 0:
             if sum(units.values()) > 0:
                 total_customers = max(total_customers, int(sum(units.values()) / 0.12))
+        day_summary = DaySummary(total_sales, total_customers)
+        if not is_meaningful_day(units, day_summary):
+            skipped += 1
+            continue
         imports.append(DayImport(day_val, total_sales, total_customers, units))
+    if skipped:
+        warnings.append(
+            f"販売ゼロかつ売上・客数が極小の日 {skipped}日は除外しました（CSVに無い幽霊日の防止）。"
+        )
+    if not imports:
+        raise ValueError("取り込み可能な有効日がありませんでした。CSVの期間と列をご確認ください。")
     return imports, warnings
 
 
