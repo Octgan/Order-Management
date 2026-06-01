@@ -1,6 +1,7 @@
 """
-フード発注管理アプリ（完全手入力版）
-- 日次の店舗売上・客数・フード9品目の販売数を画面から入力
+フード発注管理アプリ
+- Square CSVルートB（2枚同時アップロード）で日次データ取り込み
+- 手入力での追記・修正
 - ダッシュボード・発注予測
 """
 
@@ -15,10 +16,16 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from square_csv import (
+    DayImport,
+    load_uploaded_dataframe,
+    parse_dual_csv_upload,
+)
+
 # ---------------------------------------------------------------------------
 # 設定
 # ---------------------------------------------------------------------------
-APP_TITLE = "フード発注管理"
+APP_TITLE = "Square CSV連携 フード発注管理"
 DAILY_REVENUE_TARGET = 1_000_000
 COLD_STORAGE_CAPACITY = 300
 DATA_VERSION = 2  # 仕様変更時に上げると data/ を初期化
@@ -40,7 +47,9 @@ DEFAULT_PRODUCTS: list[dict[str, Any]] = [
     {"name": "チーズケーキ", "unit_price": 780},
 ]
 
-EMPTY_DATA_MESSAGE = "データがありません。「日次データ入力」タブから営業日の数値を登録してください。"
+EMPTY_DATA_MESSAGE = (
+    "データがありません。「Square売上CSVアップロード」または「日次データ入力」から登録してください。"
+)
 
 DAILY_SALES_COLUMNS = [
     "date",
@@ -269,6 +278,26 @@ def list_recorded_dates(daily_df: pd.DataFrame) -> list[date]:
     return sorted(daily_df["date"].dt.date.unique(), reverse=True)
 
 
+def bulk_import_days(imports: list[DayImport], products_df: pd.DataFrame, overwrite: bool = True) -> tuple[int, int]:
+    """CSV結合結果を daily_sales.csv に保存（日付単位で上書き）。"""
+    daily_df = load_daily_sales()
+    existing_dates = set(daily_df["date"].dt.date.tolist()) if not daily_df.empty else set()
+    created, updated = 0, 0
+    product_list = active_products(products_df)
+
+    for day_data in imports:
+        if day_data.day in existing_dates:
+            if not overwrite:
+                continue
+            updated += 1
+        else:
+            created += 1
+        units = {name: day_data.units_by_product.get(name, 0) for name in product_list["name"].astype(str)}
+        save_daily_input(day_data.day, day_data.total_sales, day_data.total_customers, units, product_list)
+
+    return created, updated
+
+
 # ---------------------------------------------------------------------------
 # 分析・グラフ
 # ---------------------------------------------------------------------------
@@ -384,6 +413,83 @@ def plot_daily_trend(product_df: pd.DataFrame, product_name: str) -> go.Figure:
 # ---------------------------------------------------------------------------
 # タブUI
 # ---------------------------------------------------------------------------
+def render_square_upload_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> None:
+    st.markdown('<p class="section-title">Square売上CSVアップロード（ルートB）</p>', unsafe_allow_html=True)
+    st.caption(
+        "2枚のCSVを同時にアップロードしてください。"
+        " ①商品別マトリックス（日付=横・商品名=縦） ②売上サマリー（日別の総客数・店舗総売上）"
+    )
+
+    uploaded_list = st.file_uploader(
+        "Square CSVファイル（最大2枚）",
+        type=["csv"],
+        accept_multiple_files=True,
+    )
+    overwrite = st.checkbox("既存日付のデータは上書きする", value=True)
+
+    if not uploaded_list:
+        if is_daily_data_empty(daily_df):
+            st.info(EMPTY_DATA_MESSAGE)
+            st.markdown(
+                "1. **商品別**の横持ちCSV（9フード品目の日別販売数・売上）  \n"
+                "2. **売上サマリー**のCSV（日別の総客数・店舗総売上）  \n"
+                "3. 2枚をまとめてドラッグ＆ドロップ → プレビュー確認 → 「データを一括取り込み」"
+            )
+        else:
+            st.info("CSVをアップロードすると、取り込みプレビューが表示されます。")
+        return
+
+    files = uploaded_list if isinstance(uploaded_list, list) else [uploaded_list]
+    if len(files) > 2:
+        st.error("アップロードは2ファイルまでにしてください。")
+        return
+
+    st.markdown("#### アップロードされたファイル")
+    for f in files:
+        kind, _df = load_uploaded_dataframe(f, products_df)
+        label = {
+            "product_matrix": "商品別マトリックス",
+            "sales_summary": "売上サマリー",
+            "unknown": "未判定",
+        }.get(kind, kind)
+        st.write(f"- **{f.name}** → {label}")
+
+    try:
+        imports, warnings = parse_dual_csv_upload(files, products_df)
+    except Exception as exc:
+        st.error(f"CSVの読み込みに失敗しました: {exc}")
+        return
+
+    if not imports:
+        st.warning("取り込み可能な日次データがありませんでした。")
+        return
+
+    preview_rows = [
+        {
+            "日付": d.day.strftime("%Y-%m-%d"),
+            "店舗総売上": d.total_sales,
+            "総客数": d.total_customers,
+            "フード販売合計": sum(d.units_by_product.values()),
+        }
+        for d in imports
+    ]
+    st.markdown("#### 取り込みプレビュー")
+    st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+
+    existing_dates = set(daily_df["date"].dt.date.tolist()) if not daily_df.empty else set()
+    overlap = [d.day for d in imports if d.day in existing_dates]
+    if overlap:
+        st.warning(f"既存データと重複する日付: {len(overlap)}日（上書き: {'ON' if overwrite else 'OFF'}）")
+
+    for msg in warnings[:8]:
+        st.caption(f"⚠ {msg}")
+
+    if st.button("データを一括取り込み", type="primary", use_container_width=True):
+        created, updated = bulk_import_days(imports, products_df, overwrite=overwrite)
+        st.success(f"取り込み完了: 新規 {created} 日 / 上書き {updated} 日")
+        st.rerun()
+
+
 def render_daily_input_form(
     products_df: pd.DataFrame,
     daily_df: pd.DataFrame,
@@ -595,7 +701,7 @@ def main() -> None:
         f"""
         <div class="main-title">
             <h1>🍽️ {APP_TITLE}</h1>
-            <p>手入力で日次データを登録 · ダッシュボード・発注予測 · 日商目安 ¥{DAILY_REVENUE_TARGET:,}+</p>
+            <p>Square CSV（ルートB）+ 手入力 · ダッシュボード・発注予測 · 日商目安 ¥{DAILY_REVENUE_TARGET:,}+</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -612,12 +718,16 @@ def main() -> None:
             st.success("データを初期化しました。")
             st.rerun()
 
-    t1, t2, t3 = st.tabs(["日次データ入力", "過去データ確認・修正", "ダッシュボード・可視化"])
+    t1, t2, t3, t4 = st.tabs(
+        ["Square CSVアップロード", "日次データ入力", "過去データ確認・修正", "ダッシュボード・可視化"]
+    )
     with t1:
-        render_daily_input_tab(products_df, daily_df)
+        render_square_upload_tab(products_df, daily_df)
     with t2:
-        render_history_tab(products_df, daily_df)
+        render_daily_input_tab(products_df, daily_df)
     with t3:
+        render_history_tab(products_df, daily_df)
+    with t4:
         render_dashboard_tab(products_df, daily_df)
 
 
