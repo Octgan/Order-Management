@@ -244,6 +244,35 @@ def find_variation_column(columns: list[str]) -> str | None:
     return find_column(columns, VARIATION_COLUMN_ALIASES)
 
 
+_CUSTOM_PRODUCT_MAPPINGS: dict[str, str] = {}
+
+
+def set_custom_product_mappings(mappings: dict[str, str] | None) -> None:
+    """square_label → アプリ登録商品名 のユーザー定義マッピング。"""
+    global _CUSTOM_PRODUCT_MAPPINGS
+    _CUSTOM_PRODUCT_MAPPINGS = dict(mappings or {})
+
+
+def get_custom_product_mappings() -> dict[str, str]:
+    return dict(_CUSTOM_PRODUCT_MAPPINGS)
+
+
+def resolve_custom_mapping(raw_name: str, product_names: list[str]) -> str | None:
+    """ユーザー紐づけ設定を最優先で適用。"""
+    name = str(raw_name).strip()
+    if not name or not _CUSTOM_PRODUCT_MAPPINGS:
+        return None
+    norm_name = normalize_product_label(name)
+    if name in _CUSTOM_PRODUCT_MAPPINGS:
+        target = _CUSTOM_PRODUCT_MAPPINGS[name]
+        if target in product_names:
+            return target
+    for key, target in _CUSTOM_PRODUCT_MAPPINGS.items():
+        if normalize_product_label(key) == norm_name and target in product_names:
+            return target
+    return None
+
+
 def build_square_product_label(item_name: str, variation: str = "") -> str:
     """Squareの「商品名」+「バリエーション」を1つの照合用文字列にする。"""
     item = str(item_name).strip()
@@ -259,6 +288,9 @@ def match_product_name(raw_name: str, product_names: list[str]) -> str | None:
     name = str(raw_name).strip()
     if not name:
         return None
+    custom = resolve_custom_mapping(name, product_names)
+    if custom:
+        return custom
     norm_name = normalize_product_label(name)
     if name in product_names:
         return name
@@ -400,6 +432,30 @@ def matrix_to_long_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return long_df[["date", "product_name", "quantity", "is_revenue"]]
 
 
+def list_square_labels_from_matrix(df: pd.DataFrame) -> list[str]:
+    """商品別マトリックスCSVに含まれる照合キー一覧（重複なし）。"""
+    prepared = prepare_square_dataframe(df)
+    if not is_matrix_format_df(prepared):
+        return []
+    cols = [str(c) for c in prepared.columns]
+    item_col = find_matrix_item_column(cols)
+    var_col = find_variation_column(cols)
+    if not item_col:
+        return []
+    labels: list[str] = []
+    seen: set[str] = set()
+    for _, row in prepared.iterrows():
+        item = str(row[item_col]).strip()
+        if not item or is_summary_row_label(item):
+            continue
+        variation = str(row[var_col]).strip() if var_col else ""
+        label = build_square_product_label(item, variation)
+        if label and label not in seen:
+            seen.add(label)
+            labels.append(label)
+    return sorted(labels)
+
+
 def summarize_square_row_mapping(df: pd.DataFrame, products_df: pd.DataFrame) -> pd.DataFrame:
     """CSV各行がどの登録商品に紐づくか一覧（取り込み前の確認用）。"""
     prepared = prepare_square_dataframe(df)
@@ -418,6 +474,7 @@ def summarize_square_row_mapping(df: pd.DataFrame, products_df: pd.DataFrame) ->
         variation = str(row[var_col]).strip() if var_col else ""
         label = build_square_product_label(item, variation)
         matched = match_product_name(label, product_names)
+        via_custom = bool(matched and resolve_custom_mapping(label, product_names))
         period_total = 0
         for dcol in date_cols:
             raw, is_rev = parse_matrix_cell(row[dcol])
@@ -430,6 +487,7 @@ def summarize_square_row_mapping(df: pd.DataFrame, products_df: pd.DataFrame) ->
                 "バリエーション": variation if variation and variation.lower() not in SKIP_VARIATION_VALUES else "—",
                 "照合キー": label,
                 "アプリ商品": matched or "（未紐づけ）",
+                "紐づけ": "手動設定" if via_custom else ("自動" if matched else "—"),
                 "期間合計": period_total,
             }
         )

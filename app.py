@@ -18,9 +18,13 @@ import streamlit as st
 
 from square_csv import (
     DayImport,
+    build_square_product_label,
     is_meaningful_day,
+    list_square_labels_from_matrix,
     load_uploaded_dataframe,
     parse_dual_csv_upload,
+    read_uploaded_csv,
+    set_custom_product_mappings,
     summarize_square_row_mapping,
 )
 
@@ -34,8 +38,11 @@ DATA_VERSION = 3  # 仕様変更時に上げると data/ を初期化
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 PRODUCTS_CSV = DATA_DIR / "products.csv"
+MAPPINGS_CSV = DATA_DIR / "product_mappings.csv"
 DAILY_CSV = DATA_DIR / "daily_sales.csv"
 VERSION_FILE = DATA_DIR / ".data_version"
+
+MAPPING_COLUMNS = ["square_label", "product_name", "created_at"]
 
 DEFAULT_PRODUCTS: list[dict[str, Any]] = [
     {"name": "ワッフル", "unit_price": 900},
@@ -139,11 +146,14 @@ def write_default_products() -> None:
 
 
 def reset_application_data() -> None:
-    """営業データと商品マスタを初期状態に戻す。"""
+    """営業データと商品マスタを初期状態に戻す（紐づけ設定は保持）。"""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     write_default_products()
     init_empty_daily_csv()
+    if not MAPPINGS_CSV.exists():
+        init_empty_mappings_csv()
     VERSION_FILE.write_text(str(DATA_VERSION), encoding="utf-8")
+    sync_square_mappings()
 
 
 def ensure_data_files() -> None:
@@ -163,6 +173,9 @@ def ensure_data_files() -> None:
         write_default_products()
     if not DAILY_CSV.exists():
         init_empty_daily_csv()
+    if not MAPPINGS_CSV.exists():
+        init_empty_mappings_csv()
+    sync_square_mappings()
 
 
 def load_products() -> pd.DataFrame:
@@ -175,6 +188,116 @@ def load_products() -> pd.DataFrame:
 def active_products(products_df: pd.DataFrame) -> pd.DataFrame:
     active = products_df[products_df["is_active"] == 1].copy()
     return active if not active.empty else products_df.copy()
+
+
+def init_empty_mappings_csv() -> None:
+    pd.DataFrame(columns=MAPPING_COLUMNS).to_csv(MAPPINGS_CSV, index=False, encoding="utf-8-sig")
+
+
+def load_product_mappings_df() -> pd.DataFrame:
+    if not MAPPINGS_CSV.exists() or MAPPINGS_CSV.stat().st_size == 0:
+        return pd.DataFrame(columns=MAPPING_COLUMNS)
+    return pd.read_csv(MAPPINGS_CSV, encoding="utf-8-sig")
+
+
+def load_product_mappings() -> dict[str, str]:
+    """square_label → product_name"""
+    df = load_product_mappings_df()
+    if df.empty:
+        return {}
+    out: dict[str, str] = {}
+    for _, row in df.iterrows():
+        label = str(row["square_label"]).strip()
+        name = str(row["product_name"]).strip()
+        if label and name:
+            out[label] = name
+    return out
+
+
+def sync_square_mappings() -> None:
+    set_custom_product_mappings(load_product_mappings())
+
+
+def save_product_mapping(square_label: str, product_name: str) -> None:
+    label = square_label.strip()
+    name = product_name.strip()
+    if not label or not name:
+        raise ValueError("Square表記とアプリ商品名を入力してください。")
+    df = load_product_mappings_df()
+    df = df[df["square_label"].astype(str).str.strip() != label]
+    df = pd.concat(
+        [
+            df,
+            pd.DataFrame(
+                [{"square_label": label, "product_name": name, "created_at": datetime.now().isoformat()}]
+            ),
+        ],
+        ignore_index=True,
+    )
+    df.to_csv(MAPPINGS_CSV, index=False, encoding="utf-8-sig")
+    sync_square_mappings()
+
+
+def delete_product_mapping(square_label: str) -> None:
+    label = square_label.strip()
+    df = load_product_mappings_df()
+    df = df[df["square_label"].astype(str).str.strip() != label]
+    if df.empty:
+        init_empty_mappings_csv()
+    else:
+        df.to_csv(MAPPINGS_CSV, index=False, encoding="utf-8-sig")
+    sync_square_mappings()
+
+
+def add_product(name: str, unit_price: int) -> None:
+    products_df = load_products()
+    name = name.strip()
+    if not name:
+        raise ValueError("商品名を入力してください。")
+    if name in set(products_df["name"].astype(str)):
+        products_df.loc[products_df["name"] == name, "is_active"] = 1
+        products_df.loc[products_df["name"] == name, "unit_price"] = int(unit_price)
+    else:
+        ids = products_df["product_id"].astype(str).tolist()
+        next_num = len(ids) + 1
+        while f"FOOD_{next_num:03d}" in ids:
+            next_num += 1
+        products_df = pd.concat(
+            [
+                products_df,
+                pd.DataFrame(
+                    [
+                        {
+                            "product_id": f"FOOD_{next_num:03d}",
+                            "name": name,
+                            "unit_price": int(unit_price),
+                            "is_active": 1,
+                            "created_at": datetime.now().isoformat(),
+                        }
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
+    products_df.to_csv(PRODUCTS_CSV, index=False, encoding="utf-8-sig")
+
+
+def update_product_price(product_id: str, unit_price: int) -> None:
+    products_df = load_products()
+    products_df.loc[products_df["product_id"] == product_id, "unit_price"] = int(unit_price)
+    products_df.to_csv(PRODUCTS_CSV, index=False, encoding="utf-8-sig")
+
+
+def deactivate_product(product_id: str) -> None:
+    products_df = load_products()
+    products_df.loc[products_df["product_id"] == product_id, "is_active"] = 0
+    products_df.to_csv(PRODUCTS_CSV, index=False, encoding="utf-8-sig")
+
+
+def activate_product(product_id: str) -> None:
+    products_df = load_products()
+    products_df.loc[products_df["product_id"] == product_id, "is_active"] = 1
+    products_df.to_csv(PRODUCTS_CSV, index=False, encoding="utf-8-sig")
 
 
 def load_daily_sales() -> pd.DataFrame:
@@ -462,7 +585,7 @@ def render_square_upload_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) 
         if is_daily_data_empty(daily_df):
             st.info(EMPTY_DATA_MESSAGE)
             st.markdown(
-                "1. **商品別**の横持ちCSV（8フード品目の日別販売数・売上）  \n"
+                f"1. **商品別**の横持ちCSV（登録フード品目の日別販売数・売上）  \n"
                 "2. **売上サマリー**のCSV（日別の総客数・店舗総売上）  \n"
                 "3. 2枚をまとめてドラッグ＆ドロップ → プレビュー確認 → 「データを一括取り込み」"
             )
@@ -616,7 +739,11 @@ def render_daily_input_form(
 
 
 def render_daily_input_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> None:
-    st.caption("iPadなどから毎日の売上・客数・8品目の販売数を入力してください。同じ日付で保存すると上書きされます。")
+    n_products = len(active_products(products_df))
+    st.caption(
+        f"iPadなどから毎日の売上・客数・{n_products}品目の販売数を入力してください。"
+        " 同じ日付で保存すると上書きされます。"
+    )
     render_daily_input_form(
         products_df,
         daily_df,
@@ -655,6 +782,168 @@ def render_history_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> Non
         title=f"{selected.strftime('%Y年%m月%d日')} のデータ修正",
         show_delete=True,
     )
+
+
+def render_products_mappings_tab(products_df: pd.DataFrame) -> None:
+    st.markdown('<p class="section-title">フード商品の登録</p>', unsafe_allow_html=True)
+    st.caption("新メニューを追加すると、手入力・CSV取り込み・ダッシュボードの対象に含められます。")
+
+    with st.form("add_product_form", clear_on_submit=True):
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            new_name = st.text_input("新しい商品名")
+        with c2:
+            new_price = st.number_input("単価（円）", min_value=0, value=800, step=10)
+        if st.form_submit_button("商品を追加", type="primary", use_container_width=True):
+            try:
+                add_product(new_name, int(new_price))
+                st.success(f"商品を登録しました: {new_name.strip()}")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+    view_df = products_df.copy()
+    view_df["状態"] = np.where(view_df["is_active"] == 1, "販売中", "停止中")
+    st.dataframe(
+        view_df[["product_id", "name", "unit_price", "状態"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    active_df = products_df[products_df["is_active"] == 1]
+    inactive_df = products_df[products_df["is_active"] == 0]
+    pc1, pc2 = st.columns(2)
+    with pc1:
+        if not active_df.empty:
+            pid = st.selectbox(
+                "単価を変更する商品",
+                active_df["product_id"],
+                format_func=lambda x: active_df.loc[active_df["product_id"] == x, "name"].iloc[0],
+                key="edit_price_product",
+            )
+            new_unit = st.number_input(
+                "新しい単価（円）",
+                min_value=0,
+                value=int(active_df.loc[active_df["product_id"] == pid, "unit_price"].iloc[0]),
+                step=10,
+                key="edit_price_value",
+            )
+            if st.button("単価を更新", key="btn_update_price"):
+                update_product_price(pid, int(new_unit))
+                st.success("単価を更新しました。")
+                st.rerun()
+    with pc2:
+        if not active_df.empty:
+            off_id = st.selectbox(
+                "販売停止",
+                active_df["product_id"],
+                format_func=lambda x: active_df.loc[active_df["product_id"] == x, "name"].iloc[0],
+                key="deactivate_product",
+            )
+            if st.button("販売停止にする", key="btn_deactivate"):
+                deactivate_product(off_id)
+                st.rerun()
+        if not inactive_df.empty:
+            on_id = st.selectbox(
+                "販売再開",
+                inactive_df["product_id"],
+                format_func=lambda x: inactive_df.loc[inactive_df["product_id"] == x, "name"].iloc[0],
+                key="activate_product",
+            )
+            if st.button("販売再開する", key="btn_activate"):
+                activate_product(on_id)
+                st.rerun()
+
+    st.markdown('<p class="section-title">Square CSV ↔ アプリ商品の紐づけ</p>', unsafe_allow_html=True)
+    st.caption(
+        "Squareの「商品名＋バリエーション」と、アプリの登録商品を対応づけます。"
+        " ここで設定した内容がCSV取り込み時に最優先されます。"
+    )
+
+    mappings_df = load_product_mappings_df()
+    if mappings_df.empty:
+        st.info("まだ手動紐づけはありません。下のフォームから追加するか、CSVを読み込んで未登録行から設定してください。")
+    else:
+        show_map = mappings_df.rename(
+            columns={"square_label": "Square表記（照合キー）", "product_name": "アプリ商品"}
+        )
+        st.dataframe(show_map[["Square表記（照合キー）", "アプリ商品"]], use_container_width=True, hide_index=True)
+        del_label = st.selectbox(
+            "削除する紐づけ",
+            mappings_df["square_label"].astype(str).tolist(),
+            key="delete_mapping_select",
+        )
+        if st.button("選択した紐づけを削除", type="secondary"):
+            delete_product_mapping(del_label)
+            st.success("紐づけを削除しました。")
+            st.rerun()
+
+    st.markdown("#### 紐づけを追加")
+    product_names = active_products(products_df)["name"].astype(str).tolist()
+    if not product_names:
+        st.warning("先にフード商品を登録してください。")
+        return
+
+    tab_key, tab_parts = st.tabs(["照合キーで登録", "商品名＋バリエーションで登録"])
+
+    with tab_key:
+        with st.form("mapping_by_label_form"):
+            square_label = st.text_input(
+                "Square照合キー",
+                placeholder="例: パイ レモンクリーム / リエージュワッフル プレーン",
+            )
+            target_product = st.selectbox("アプリの商品", product_names, key="map_target_label")
+            if st.form_submit_button("紐づけを保存", type="primary"):
+                try:
+                    save_product_mapping(square_label, target_product)
+                    st.success(f"「{square_label.strip()}」→ {target_product}")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+
+    with tab_parts:
+        with st.form("mapping_by_parts_form"):
+            sq_item = st.text_input("Square商品名", placeholder="例: パイ")
+            sq_var = st.text_input("Squareバリエーション", placeholder="例: レモンクリーム（定価の場合は空でOK）")
+            target_product2 = st.selectbox("アプリの商品", product_names, key="map_target_parts")
+            preview = build_square_product_label(sq_item, sq_var)
+            st.caption(f"照合キープレビュー: **{preview or '（未入力）'}**")
+            if st.form_submit_button("紐づけを保存", type="primary"):
+                try:
+                    if not preview:
+                        raise ValueError("Square商品名を入力してください。")
+                    save_product_mapping(preview, target_product2)
+                    st.success(f"「{preview}」→ {target_product2}")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+
+    st.markdown("#### CSVから未紐づけ行を探す")
+    scan_file = st.file_uploader(
+        "商品別マトリックスCSV（任意）",
+        type=["csv"],
+        key="mapping_scan_csv",
+    )
+    if scan_file:
+        try:
+            raw_df = read_uploaded_csv(scan_file)
+            from square_csv import match_product_name
+
+            sync_square_mappings()
+            labels = list_square_labels_from_matrix(raw_df)
+            need_map = [lb for lb in labels if not match_product_name(lb, product_names)]
+            if not need_map:
+                st.success("このCSVの行はすべて紐づけ済みです。")
+            else:
+                st.warning(f"未紐づけ {len(need_map)} 件 — 下で一括登録できます。")
+                pick_label = st.selectbox("Square表記", need_map, key="quick_map_label")
+                quick_target = st.selectbox("アプリ商品", product_names, key="quick_map_target")
+                if st.button("この1件を紐づけ登録", type="primary"):
+                    save_product_mapping(pick_label, quick_target)
+                    st.success("登録しました。")
+                    st.rerun()
+        except Exception as exc:
+            st.error(f"CSVの読み込みに失敗しました: {exc}")
 
 
 def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> None:
@@ -775,8 +1064,14 @@ def main() -> None:
             st.success("データを初期化しました。")
             st.rerun()
 
-    t1, t2, t3, t4 = st.tabs(
-        ["Square CSVアップロード", "日次データ入力", "過去データ確認・修正", "ダッシュボード・可視化"]
+    t1, t2, t3, t4, t5 = st.tabs(
+        [
+            "Square CSVアップロード",
+            "日次データ入力",
+            "過去データ確認・修正",
+            "商品・紐づけ設定",
+            "ダッシュボード・可視化",
+        ]
     )
     with t1:
         render_square_upload_tab(products_df, daily_df)
@@ -785,6 +1080,8 @@ def main() -> None:
     with t3:
         render_history_tab(products_df, daily_df)
     with t4:
+        render_products_mappings_tab(products_df)
+    with t5:
         render_dashboard_tab(products_df, daily_df)
 
 
