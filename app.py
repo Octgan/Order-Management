@@ -7,9 +7,14 @@
 
 from __future__ import annotations
 
+import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+_APP_ROOT = Path(__file__).resolve().parent
+if str(_APP_ROOT) not in sys.path:
+    sys.path.insert(0, str(_APP_ROOT))
 
 import numpy as np
 import pandas as pd
