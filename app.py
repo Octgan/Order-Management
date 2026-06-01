@@ -1,7 +1,7 @@
 """
 フード発注管理アプリ
 - Square CSVルートB（2枚同時アップロード）で日次データ取り込み
-- 手入力での追記・修正
+- 過去データの確認・修正
 - ダッシュボード・発注予測
 """
 
@@ -32,9 +32,9 @@ from square_csv import (
 # 設定
 # ---------------------------------------------------------------------------
 APP_TITLE = "Square CSV連携 フード発注管理"
-DAILY_REVENUE_TARGET = 1_000_000
 COLD_STORAGE_CAPACITY = 300
-DATA_VERSION = 3  # 仕様変更時に上げると data/ を初期化
+DATA_VERSION = 5  # 仕様変更時に上げると data/ を初期化（4→5は税抜へ戻す）
+STANDARD_CONSUMPTION_TAX_RATE = 0.10
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 PRODUCTS_CSV = DATA_DIR / "products.csv"
@@ -56,8 +56,10 @@ DEFAULT_PRODUCTS: list[dict[str, Any]] = [
 ]
 
 EMPTY_DATA_MESSAGE = (
-    "データがありません。「Square売上CSVアップロード」または「日次データ入力」から登録してください。"
+    "データがありません。「Square CSVアップロード」タブからCSVを取り込んでください。"
 )
+
+WEEKDAY_LABELS_JA = ["月", "火", "水", "木", "金", "土", "日"]
 
 DAILY_SALES_COLUMNS = [
     "date",
@@ -105,6 +107,42 @@ def inject_css() -> None:
 
 def to_ts(d: date) -> pd.Timestamp:
     return pd.Timestamp(d)
+
+
+def tax_exclusive_price(inclusive_yen: int, rate: float = STANDARD_CONSUMPTION_TAX_RATE) -> int:
+    """税込金額を税抜（四捨五入）に換算。"""
+    if inclusive_yen <= 0:
+        return 0
+    return int(round(inclusive_yen / (1 + rate)))
+
+
+def migrate_v4_to_tax_exclusive() -> None:
+    """v4→v5: 税込にしていた単価・保存済み売上を税抜に戻す。以降CSVは純売上高を使用。"""
+    products_df = load_products()
+    products_df["unit_price"] = products_df["unit_price"].apply(
+        lambda p: tax_exclusive_price(int(p))
+    )
+    products_df.to_csv(PRODUCTS_CSV, index=False, encoding="utf-8-sig")
+
+    daily_df = load_daily_sales()
+    if not daily_df.empty:
+        price_by_id = dict(zip(products_df["product_id"], products_df["unit_price"]))
+        daily_df["unit_price"] = daily_df["product_id"].map(price_by_id).fillna(daily_df["unit_price"])
+        for day_val, group in daily_df.groupby(daily_df["date"].dt.date):
+            mask = daily_df["date"].dt.date == day_val
+            old_total = int(group["total_sales"].iloc[0])
+            new_total = tax_exclusive_price(old_total)
+            daily_df.loc[mask, "total_sales"] = new_total
+            if "product_sales" in daily_df.columns:
+                daily_df.loc[mask, "product_sales"] = (
+                    pd.to_numeric(daily_df.loc[mask, "product_sales"], errors="coerce")
+                    .fillna(0)
+                    .apply(tax_exclusive_price)
+                    .astype(int)
+                )
+        daily_df.to_csv(DAILY_CSV, index=False, encoding="utf-8-sig")
+
+    VERSION_FILE.write_text(str(DATA_VERSION), encoding="utf-8")
 
 
 def is_daily_data_empty(daily_df: pd.DataFrame | None = None) -> bool:
@@ -167,7 +205,12 @@ def ensure_data_files() -> None:
             stored_version = 0
 
     if stored_version < DATA_VERSION:
-        reset_application_data()
+        if stored_version == 4 and DATA_VERSION >= 5:
+            migrate_v4_to_tax_exclusive()
+        elif stored_version == 3 and DATA_VERSION >= 5:
+            VERSION_FILE.write_text(str(DATA_VERSION), encoding="utf-8")
+        else:
+            reset_application_data()
         return
 
     if not PRODUCTS_CSV.exists():
@@ -319,7 +362,7 @@ def load_daily_sales() -> pd.DataFrame:
 def allocate_product_sales_from_store(
     total_sales: int, units_by_product: dict[str, int]
 ) -> dict[str, int]:
-    """手入力時: 店舗総売上を登録フードの販売数比率で按分。"""
+    """日別保存時: 店舗総売上を登録フードの販売数比率で按分。"""
     total_units = sum(units_by_product.values())
     if total_sales <= 0 or total_units <= 0:
         return {name: 0 for name in units_by_product}
@@ -330,7 +373,7 @@ def allocate_product_sales_from_store(
 
 
 def calc_single_item_sales_indicator(store_total_sales: int, units_sold: int) -> int:
-    """単品売上高 = その日の店舗総売上 ÷ 当該商品の販売個数。"""
+    """単品売上高（税抜）= その日の店舗純売上 ÷ 当該商品の販売個数。"""
     if units_sold <= 0 or store_total_sales <= 0:
         return 0
     return int(store_total_sales / units_sold)
@@ -424,29 +467,6 @@ def get_daily_record_by_date(daily_df: pd.DataFrame, target_date: date) -> tuple
     }
     units_map = dict(zip(day_rows["product_name"].astype(str), day_rows["units_sold"].astype(int)))
     return totals, units_map
-
-
-def make_daily_summary_table(daily_df: pd.DataFrame) -> pd.DataFrame:
-    if daily_df.empty:
-        return pd.DataFrame(columns=["日付", "店舗総売上", "総客数", "フード販売合計"])
-    summary = (
-        daily_df.groupby("date", as_index=False)
-        .agg(
-            total_sales=("total_sales", "first"),
-            total_customers=("total_customers", "first"),
-            total_food_units=("units_sold", "sum"),
-        )
-        .sort_values("date", ascending=False)
-    )
-    summary["date"] = summary["date"].dt.date.astype(str)
-    return summary.rename(
-        columns={
-            "date": "日付",
-            "total_sales": "店舗総売上",
-            "total_customers": "総客数",
-            "total_food_units": "フード販売合計",
-        }
-    )
 
 
 def list_recorded_dates(daily_df: pd.DataFrame) -> list[date]:
@@ -573,13 +593,194 @@ def four_week_same_weekday_avg(daily_df: pd.DataFrame, product_id: str, ref: dat
     return float(last_4["units_sold"].mean()) if not last_4.empty else 0.0
 
 
-def calc_food_selection_rate(daily_df: pd.DataFrame, product_id: str, day_totals: pd.DataFrame, days: int = 7) -> float:
-    if daily_df.empty or day_totals.empty:
+def calc_avg_units_sold_in_period(
+    daily_df: pd.DataFrame,
+    product_id: str,
+    start_date: date,
+    end_date: date,
+) -> dict[str, float | int]:
+    """指定期間の販売個数統計（データ登録がある日のみ）。"""
+    if start_date > end_date or daily_df.empty:
+        return {"avg": 0.0, "total": 0, "days": 0, "active_days": 0}
+    sub = daily_df[
+        (daily_df["product_id"] == product_id)
+        & (daily_df["date"] >= to_ts(start_date))
+        & (daily_df["date"] <= to_ts(end_date))
+    ]
+    if sub.empty:
+        return {"avg": 0.0, "total": 0, "days": 0, "active_days": 0}
+    units = sub["units_sold"].astype(int)
+    days = int(len(sub))
+    total = int(units.sum())
+    active_days = int((units > 0).sum())
+    return {
+        "avg": float(units.mean()),
+        "total": total,
+        "days": days,
+        "active_days": active_days,
+    }
+
+
+def calc_avg_units_by_weekday_in_period(
+    daily_df: pd.DataFrame,
+    product_id: str,
+    start_date: date,
+    end_date: date,
+) -> pd.DataFrame:
+    """指定期間の曜日別平均販売個数（登録がある日のみ、月〜日）。"""
+    columns = ["weekday", "曜日", "avg_units", "days", "total_units"]
+    if start_date > end_date or daily_df.empty:
+        return pd.DataFrame(columns=columns)
+    sub = daily_df[
+        (daily_df["product_id"] == product_id)
+        & (daily_df["date"] >= to_ts(start_date))
+        & (daily_df["date"] <= to_ts(end_date))
+    ][["date", "units_sold"]].copy()
+    if sub.empty:
+        return pd.DataFrame(columns=columns)
+    sub["weekday"] = sub["date"].dt.weekday
+    grouped = (
+        sub.groupby("weekday", as_index=False)
+        .agg(avg_units=("units_sold", "mean"), days=("units_sold", "count"), total_units=("units_sold", "sum"))
+        .sort_values("weekday")
+    )
+    grouped["曜日"] = grouped["weekday"].map(lambda w: WEEKDAY_LABELS_JA[int(w)])
+    return grouped[columns]
+
+
+def plot_weekday_avg_units(weekday_df: pd.DataFrame, product_name: str, period_label: str) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=weekday_df["曜日"],
+            y=weekday_df["avg_units"],
+            marker_color="#0f3460",
+            text=[f"{v:,.1f} 個" for v in weekday_df["avg_units"]],
+            textposition="outside",
+            customdata=np.stack([weekday_df["days"], weekday_df["total_units"]], axis=-1),
+            hovertemplate=(
+                "曜日: %{x}<br>"
+                "平均販売数: %{y:,.1f} 個<br>"
+                "集計日数: %{customdata[0]} 日<br>"
+                "合計: %{customdata[1]:,} 個<extra></extra>"
+            ),
+        )
+    )
+    fig.update_layout(
+        title=f"{product_name} — 曜日別の平均販売個数（{period_label}）",
+        xaxis_title="曜日",
+        yaxis_title="平均販売数（個/日）",
+        template="plotly_white",
+        height=360,
+        showlegend=False,
+    )
+    return fig
+
+
+def calc_avg_customers_in_period(
+    day_totals: pd.DataFrame,
+    start_date: date,
+    end_date: date,
+) -> dict[str, float | int]:
+    """指定期間の店舗客数統計（登録がある日のみ）。"""
+    if start_date > end_date or day_totals.empty:
+        return {"avg": 0.0, "total": 0, "days": 0, "active_days": 0}
+    sub = day_totals[
+        (day_totals["date"] >= to_ts(start_date)) & (day_totals["date"] <= to_ts(end_date))
+    ]
+    if sub.empty:
+        return {"avg": 0.0, "total": 0, "days": 0, "active_days": 0}
+    customers = sub["total_customers"].astype(int)
+    days = int(len(sub))
+    total = int(customers.sum())
+    active_days = int((customers > 0).sum())
+    return {
+        "avg": float(customers.mean()),
+        "total": total,
+        "days": days,
+        "active_days": active_days,
+    }
+
+
+def build_customer_trend_frame(
+    day_totals: pd.DataFrame,
+    start_date: date,
+    end_date: date,
+) -> pd.DataFrame:
+    if start_date > end_date or day_totals.empty:
+        return pd.DataFrame(columns=["date", "total_customers"])
+    sub = day_totals[
+        (day_totals["date"] >= to_ts(start_date)) & (day_totals["date"] <= to_ts(end_date))
+    ][["date", "total_customers"]].copy()
+    return sub.sort_values("date")
+
+
+def plot_customer_trend(customer_df: pd.DataFrame, period_avg: float, period_label: str) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=customer_df["date"],
+            y=customer_df["total_customers"],
+            mode="lines+markers",
+            name="日次客数",
+            line=dict(color="#16a085", width=3),
+            marker=dict(size=7),
+            hovertemplate="日付: %{x|%Y-%m-%d}<br>客数: %{y:,}人<extra></extra>",
+        )
+    )
+    if period_avg > 0:
+        fig.add_hline(
+            y=period_avg,
+            line_dash="dash",
+            line_color="#e94560",
+            annotation_text=f"期間平均 {period_avg:,.1f} 人",
+            annotation_position="top right",
+        )
+    fig.update_layout(
+        title=f"店舗客数の推移（{period_label}）",
+        xaxis_title="日付",
+        yaxis_title="客数（人）",
+        template="plotly_white",
+        height=380,
+        hovermode="x unified",
+        showlegend=False,
+    )
+    return fig
+
+
+def resolve_dashboard_period(
+    period_preset: str,
+    *,
+    data_min: date,
+    data_max: date,
+    latest_date: date,
+) -> tuple[date, date]:
+    if period_preset == "直近7日":
+        return max(data_min, latest_date - timedelta(days=6)), latest_date
+    if period_preset == "直近30日":
+        return max(data_min, latest_date - timedelta(days=29)), latest_date
+    if period_preset == "直近90日":
+        return max(data_min, latest_date - timedelta(days=89)), latest_date
+    return data_min, data_max
+
+
+def calc_food_selection_rate(
+    daily_df: pd.DataFrame,
+    product_id: str,
+    day_totals: pd.DataFrame,
+    start_date: date,
+    end_date: date,
+) -> float:
+    """指定期間のフード選択率 = 対象商品の販売数合計 ÷ 店舗客数合計。"""
+    if daily_df.empty or day_totals.empty or start_date > end_date:
         return 0.0
-    end_date = get_latest_business_date(daily_df, day_totals) or date.today()
+    start = to_ts(start_date)
     end = to_ts(end_date)
-    start = to_ts(end_date - timedelta(days=days))
-    sub = daily_df[(daily_df["product_id"] == product_id) & (daily_df["date"] >= start) & (daily_df["date"] <= end)]
+    sub = daily_df[
+        (daily_df["product_id"] == product_id)
+        & (daily_df["date"] >= start)
+        & (daily_df["date"] <= end)
+    ]
     totals = day_totals[(day_totals["date"] >= start) & (day_totals["date"] <= end)]
     customer_sum = int(totals["total_customers"].sum())
     if sub.empty or customer_sum == 0:
@@ -612,27 +813,55 @@ def build_product_trend_frame(
     daily_df: pd.DataFrame,
     product_id: str,
     *,
+    start_date: date,
     end_date: date,
-    days: int = 30,
 ) -> pd.DataFrame:
-    """日次の販売数・店舗総売上・単品売上高（店舗総売上÷販売数）をまとめる。"""
-    start = to_ts(end_date - timedelta(days=days))
+    """日次の販売数・店舗純売上・単品売上高（店舗純売上÷販売数）をまとめる。"""
+    if start_date > end_date:
+        return pd.DataFrame(columns=["date", "units_sold", "total_sales", "single_item_sales"])
     product_part = daily_df[
-        (daily_df["product_id"] == product_id) & (daily_df["date"] >= start) & (daily_df["date"] <= to_ts(end_date))
+        (daily_df["product_id"] == product_id)
+        & (daily_df["date"] >= to_ts(start_date))
+        & (daily_df["date"] <= to_ts(end_date))
     ].copy()
     if product_part.empty:
         return pd.DataFrame(columns=["date", "units_sold", "total_sales", "single_item_sales"])
 
-    day_totals = get_day_totals(daily_df)
-    merged = product_part.merge(day_totals, on="date", how="left")
+    store_by_day = get_day_totals(daily_df)[["date", "total_sales", "total_customers"]].rename(
+        columns={"total_sales": "store_total_sales", "total_customers": "store_total_customers"}
+    )
+    merged = product_part[["date", "units_sold"]].merge(store_by_day, on="date", how="left")
+    merged["store_total_sales"] = pd.to_numeric(merged["store_total_sales"], errors="coerce").fillna(0).astype(int)
     merged["single_item_sales"] = merged.apply(
-        lambda r: calc_single_item_sales_indicator(int(r["total_sales"]), int(r["units_sold"])),
+        lambda r: calc_single_item_sales_indicator(int(r["store_total_sales"]), int(r["units_sold"])),
         axis=1,
     )
+    merged["total_sales"] = merged["store_total_sales"]
     return merged.sort_values("date")
 
 
-def plot_daily_trend(product_df: pd.DataFrame, product_name: str) -> go.Figure:
+def calc_single_item_sales_stats_in_period(
+    daily_df: pd.DataFrame,
+    product_id: str,
+    start_date: date,
+    end_date: date,
+) -> dict[str, float | int]:
+    """指定期間の単品売上高統計（販売数>0の日のみで平均）。"""
+    trend = build_product_trend_frame(daily_df, product_id, start_date=start_date, end_date=end_date)
+    if trend.empty:
+        return {"avg": 0.0, "days": 0, "active_days": 0}
+    active = trend[trend["units_sold"] > 0]
+    days = int(len(trend))
+    if active.empty:
+        return {"avg": 0.0, "days": days, "active_days": 0}
+    return {
+        "avg": float(active["single_item_sales"].mean()),
+        "days": days,
+        "active_days": int(len(active)),
+    }
+
+
+def plot_daily_trend(product_df: pd.DataFrame, product_name: str, period_label: str = "") -> go.Figure:
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
@@ -643,8 +872,9 @@ def plot_daily_trend(product_df: pd.DataFrame, product_name: str) -> go.Figure:
             line=dict(color="#e94560", width=3),
         )
     )
+    title_suffix = f"（{period_label}）" if period_label else ""
     fig.update_layout(
-        title=f"{product_name} — 日次販売数推移",
+        title=f"{product_name} — 日次販売数推移{title_suffix}",
         xaxis_title="日付",
         yaxis_title="販売数（個）",
         template="plotly_white",
@@ -654,8 +884,10 @@ def plot_daily_trend(product_df: pd.DataFrame, product_name: str) -> go.Figure:
     return fig
 
 
-def plot_single_item_sales_trend(trend_df: pd.DataFrame, product_name: str) -> go.Figure:
-    """単品売上高（店舗総売上÷販売数）の日次推移。"""
+def plot_single_item_sales_trend(
+    trend_df: pd.DataFrame, product_name: str, period_label: str = "", period_avg: float = 0.0
+) -> go.Figure:
+    """単品売上高（店舗純売上÷販売数）の日次推移。"""
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
@@ -671,15 +903,24 @@ def plot_single_item_sales_trend(trend_df: pd.DataFrame, product_name: str) -> g
             hovertemplate=(
                 "日付: %{x|%Y-%m-%d}<br>"
                 "単品売上高: ¥%{y:,}<br>"
-                "店舗総売上: ¥%{customdata[0]:,}<br>"
+                "店舗純売上: ¥%{customdata[0]:,}<br>"
                 "販売数: %{customdata[1]:,}個<extra></extra>"
             ),
         )
     )
+    if period_avg > 0:
+        fig.add_hline(
+            y=period_avg,
+            line_dash="dash",
+            line_color="#e94560",
+            annotation_text=f"期間平均 ¥{period_avg:,.0f}",
+            annotation_position="top right",
+        )
+    title_suffix = f"（{period_label}）" if period_label else ""
     fig.update_layout(
-        title=f"{product_name} — 単品売上高の推移（店舗総売上÷販売数）",
+        title=f"{product_name} — 単品売上高の推移・税抜{title_suffix}",
         xaxis_title="日付",
-        yaxis_title="単品売上高（円）",
+        yaxis_title="単品売上高・税抜（円）",
         template="plotly_white",
         height=360,
         hovermode="x unified",
@@ -694,7 +935,8 @@ def render_square_upload_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) 
     st.markdown('<p class="section-title">Square売上CSVアップロード（ルートB）</p>', unsafe_allow_html=True)
     st.caption(
         "2枚のCSVを同時にアップロードしてください。"
-        " ①商品別マトリックス（日付=横・商品名=縦） ②売上サマリー（日別の総客数・店舗総売上）"
+        " ①商品別マトリックス、または期間の「商品売上サマリー」"
+        " ②売上サマリー（客数・店舗純売上＝税抜で取り込み）"
     )
 
     uploaded_list = st.file_uploader(
@@ -710,7 +952,7 @@ def render_square_upload_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) 
             st.markdown(
                 f"1. **商品別**の横持ちCSV（登録フード品目の日別販売数・売上）  \n"
                 "2. **売上サマリー**のCSV（日別の総客数・店舗総売上）  \n"
-                "3. 2枚をまとめてドラッグ＆ドロップ → プレビュー確認 → 「データを一括取り込み」"
+                "3. 2枚をまとめてドラッグ＆ドロップ → 「データを一括取り込み」→ 下のプレビューで確認"
             )
         else:
             st.info("CSVをアップロードすると、取り込みプレビューが表示されます。")
@@ -720,16 +962,6 @@ def render_square_upload_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) 
     if len(files) > 2:
         st.error("アップロードは2ファイルまでにしてください。")
         return
-
-    st.markdown("#### アップロードされたファイル")
-    for f in files:
-        kind, _df = load_uploaded_dataframe(f, products_df)
-        label = {
-            "product_matrix": "商品別マトリックス",
-            "sales_summary": "売上サマリー",
-            "unknown": "未判定",
-        }.get(kind, kind)
-        st.write(f"- **{f.name}** → {label}")
 
     try:
         imports, warnings = parse_dual_csv_upload(files, products_df)
@@ -741,10 +973,32 @@ def render_square_upload_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) 
         st.warning("取り込み可能な日次データがありませんでした。")
         return
 
+    existing_dates = set(daily_df["date"].dt.date.tolist()) if not daily_df.empty else set()
+    overlap = [d.day for d in imports if d.day in existing_dates]
+    if overlap:
+        st.warning(f"既存データと重複する日付: {len(overlap)}日（上書き: {'ON' if overwrite else 'OFF'}）")
+
+    import_ready = st.button("データを一括取り込み", type="primary", use_container_width=True)
+    if import_ready:
+        created, updated = bulk_import_days(imports, products_df, overwrite=overwrite)
+        st.success(f"取り込み完了: 新規 {created} 日 / 上書き {updated} 日")
+        st.rerun()
+
+    st.markdown("#### アップロードされたファイル")
+    for f in files:
+        kind, _df = load_uploaded_dataframe(f, products_df)
+        label = {
+            "product_matrix": "商品別マトリックス",
+            "product_period_summary": "商品売上サマリー（期間）",
+            "sales_summary": "売上サマリー",
+            "unknown": "未判定",
+        }.get(kind, kind)
+        st.write(f"- **{f.name}** → {label}")
+
     preview_rows = [
         {
             "日付": d.day.strftime("%Y-%m-%d"),
-            "店舗総売上": d.total_sales,
+            "店舗純売上（税抜）": d.total_sales,
             "総客数": d.total_customers,
             "フード販売合計": sum(d.units_by_product.values()),
         }
@@ -753,7 +1007,15 @@ def render_square_upload_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) 
     st.markdown("#### 取り込みプレビュー（日別）")
     st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
 
-    product_file = next((f for f in files if load_uploaded_dataframe(f, products_df)[0] == "product_matrix"), None)
+    product_file = next(
+        (
+            f
+            for f in files
+            if load_uploaded_dataframe(f, products_df)[0]
+            in ("product_matrix", "product_period_summary")
+        ),
+        None,
+    )
     if product_file is not None:
         _kind, product_df_raw = load_uploaded_dataframe(product_file, products_df)
         mapping_df = summarize_square_row_mapping(product_df_raw, products_df)
@@ -772,18 +1034,8 @@ def render_square_upload_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) 
         )
         st.dataframe(unit_preview, use_container_width=True, hide_index=True)
 
-    existing_dates = set(daily_df["date"].dt.date.tolist()) if not daily_df.empty else set()
-    overlap = [d.day for d in imports if d.day in existing_dates]
-    if overlap:
-        st.warning(f"既存データと重複する日付: {len(overlap)}日（上書き: {'ON' if overwrite else 'OFF'}）")
-
     for msg in warnings[:8]:
         st.caption(f"⚠ {msg}")
-
-    if st.button("データを一括取り込み", type="primary", use_container_width=True):
-        created, updated = bulk_import_days(imports, products_df, overwrite=overwrite)
-        st.success(f"取り込み完了: 新規 {created} 日 / 上書き {updated} 日")
-        st.rerun()
 
 
 def render_daily_input_form(
@@ -811,7 +1063,7 @@ def render_daily_input_form(
         c1, c2 = st.columns(2)
         with c1:
             total_sales = st.number_input(
-                "店舗総売上（円）",
+                "店舗純売上・税抜（円）",
                 min_value=0,
                 value=int(totals["total_sales"]),
                 step=1000,
@@ -861,34 +1113,12 @@ def render_daily_input_form(
             st.rerun()
 
 
-def render_daily_input_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> None:
-    n_products = len(active_products(products_df))
-    st.caption(
-        f"iPadなどから毎日の売上・客数・{n_products}品目の販売数を入力してください。"
-        " 同じ日付で保存すると上書きされます。"
-    )
-    render_daily_input_form(
-        products_df,
-        daily_df,
-        form_key="main_daily_input",
-        default_date=date.today(),
-        title="日次データ入力",
-    )
-
-    st.markdown('<p class="section-title">登録済みデータ一覧</p>', unsafe_allow_html=True)
-    summary = make_daily_summary_table(daily_df)
-    if summary.empty:
-        st.info("まだ登録された日次データはありません。")
-    else:
-        st.dataframe(summary, use_container_width=True, hide_index=True)
-
-
 def render_history_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> None:
     st.markdown('<p class="section-title">過去データの確認・修正</p>', unsafe_allow_html=True)
 
     dates = list_recorded_dates(daily_df)
     if not dates:
-        st.info("修正できる過去データがありません。先に日次データを入力してください。")
+        st.info("修正できる過去データがありません。先に Square CSV を取り込んでください。")
         return
 
     selected = st.selectbox(
@@ -909,14 +1139,17 @@ def render_history_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> Non
 
 def render_products_mappings_tab(products_df: pd.DataFrame) -> None:
     st.markdown('<p class="section-title">フード商品の登録</p>', unsafe_allow_html=True)
-    st.caption("新メニューを追加すると、手入力・CSV取り込み・ダッシュボードの対象に含められます。")
+    st.caption(
+        "新メニューを追加すると、CSV取り込み・ダッシュボードの対象に含められます。"
+        " **単価は税抜** で登録してください（Squareの純売上・商品単価と揃えます）。"
+    )
 
     with st.form("add_product_form", clear_on_submit=True):
         c1, c2 = st.columns([2, 1])
         with c1:
             new_name = st.text_input("新しい商品名")
         with c2:
-            new_price = st.number_input("単価（円）", min_value=0, value=800, step=10)
+            new_price = st.number_input("単価・税抜（円）", min_value=0, value=800, step=10)
         if st.form_submit_button("商品を追加", type="primary", use_container_width=True):
             try:
                 add_product(new_name, int(new_price))
@@ -945,7 +1178,7 @@ def render_products_mappings_tab(products_df: pd.DataFrame) -> None:
                 key="edit_price_product",
             )
             new_unit = st.number_input(
-                "新しい単価（円）",
+                "新しい単価・税抜（円）",
                 min_value=0,
                 value=int(active_df.loc[active_df["product_id"] == pid, "unit_price"].iloc[0]),
                 step=10,
@@ -1101,74 +1334,233 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
 
     lw_sales = last_week_same_day_sales(daily_df, product_id, latest_date)
     avg_4w = four_week_same_weekday_avg(daily_df, product_id, latest_date)
-    selection_rate = calc_food_selection_rate(daily_df, product_id, day_totals, days=7)
 
     latest_label = latest_date.strftime("%Y/%m/%d")
     st.caption(
-        f"単品売上高 ＝ 店舗総売上（¥{day_total_sales:,}）÷ 販売数（{latest_units:,}個）"
+        f"単品売上高（税抜） ＝ 店舗純売上（¥{day_total_sales:,}）÷ 販売数（{latest_units:,}個）"
         f" ＝ **¥{single_item_sales:,}**（{latest_label}）"
     )
     m1, m2, m3, m4 = st.columns(4)
     with m1:
-        st.metric(f"単品売上高（{latest_label}）", f"¥{single_item_sales:,}")
+        st.metric(f"単品売上高・税抜（{latest_label}）", f"¥{single_item_sales:,}")
     with m2:
-        st.metric(f"店舗総売上（{latest_label}）", f"¥{day_total_sales:,}")
+        st.metric(f"店舗純売上・税抜（{latest_label}）", f"¥{day_total_sales:,}")
     with m3:
         st.metric(f"販売数（{latest_label}）", f"{latest_units:,} 個")
     with m4:
         st.metric("前週同曜日販売数", f"{lw_sales:,} 個")
-    st.metric("フード選択率（直近7日）", f"{selection_rate:.2%}")
 
-    trend_df = build_product_trend_frame(daily_df, product_id, end_date=latest_date, days=30)
+    recorded = list_recorded_dates(daily_df)
+    data_min = recorded[-1] if recorded else latest_date
+    data_max = latest_date
 
-    c1, c2 = st.columns([1, 1.4])
-    with c1:
-        st.plotly_chart(plot_weekday_comparison(lw_sales, avg_4w, selected_name), use_container_width=True)
-        st.caption(f"過去1か月同曜日平均: **{avg_4w:,.1f} 個**")
-    with c2:
-        if not trend_df.empty:
-            st.plotly_chart(plot_daily_trend(trend_df, selected_name), use_container_width=True)
-        else:
-            st.info("グラフ表示に必要な日次データがありません。")
-
-    st.markdown('<p class="section-title">単品売上高の推移</p>', unsafe_allow_html=True)
-    sales_trend = trend_df[trend_df["units_sold"] > 0] if not trend_df.empty else trend_df
-    if sales_trend.empty:
-        st.info("単品売上高のグラフを表示するデータがありません。")
+    st.markdown('<p class="section-title">詳細分析</p>', unsafe_allow_html=True)
+    period_col, _ = st.columns([2, 3])
+    with period_col:
+        period_preset = st.selectbox(
+            "集計期間（フード選択率・詳細分析の各タブ共通）",
+            ["直近7日", "直近30日", "直近90日", "全期間", "日付を指定"],
+            key="dashboard_avg_period_preset",
+        )
+    if period_preset == "日付を指定":
+        dcol1, dcol2 = st.columns(2)
+        with dcol1:
+            period_start = st.date_input(
+                "開始日",
+                value=max(data_min, latest_date - timedelta(days=29)),
+                min_value=data_min,
+                max_value=data_max,
+                key="dashboard_avg_period_start",
+            )
+        with dcol2:
+            period_end = st.date_input(
+                "終了日",
+                value=latest_date,
+                min_value=data_min,
+                max_value=data_max,
+                key="dashboard_avg_period_end",
+            )
     else:
-        st.plotly_chart(plot_single_item_sales_trend(sales_trend, selected_name), use_container_width=True)
-        st.caption("各日の **店舗総売上 ÷ 当該商品の販売数**（直近30日・販売数0の日は除外）。")
+        period_start, period_end = resolve_dashboard_period(
+            period_preset,
+            data_min=data_min,
+            data_max=data_max,
+            latest_date=latest_date,
+        )
+    period_label = f"{period_start:%Y/%m/%d} 〜 {period_end:%Y/%m/%d}"
 
-    st.markdown('<p class="section-title">発注予測シミュレーター</p>', unsafe_allow_html=True)
-    fc1, fc2, fc3 = st.columns(3)
-    predicted_customers = fc1.number_input("予測客数", min_value=100, max_value=6000, value=2400, step=50)
-    correction_pct = fc2.slider("天気・イベント補正（%）", -30, 50, 0)
-    current_stock = fc3.number_input("現在の在庫数（個）", min_value=0, max_value=5000, value=120, step=5)
+    selection_rate = calc_food_selection_rate(
+        daily_df, product_id, day_totals, period_start, period_end
+    )
+    sr1, sr2 = st.columns([1, 3])
+    with sr1:
+        st.metric(f"フード選択率（{period_label}）", f"{selection_rate:.2%}")
+    with sr2:
+        st.caption(
+            f"**{selected_name}** の販売数 ÷ 店舗客数（指定期間の合計）。"
+            " 発注予測タブの計算にもこの期間の選択率を使います。"
+        )
 
-    correction_factor = 1.0 + correction_pct / 100.0
-    recommended = max(0, int(round(predicted_customers * selection_rate * correction_factor - current_stock)))
+    period_stats = calc_avg_units_sold_in_period(daily_df, product_id, period_start, period_end)
+    weekday_units = calc_avg_units_by_weekday_in_period(daily_df, product_id, period_start, period_end)
+    business_latest = get_latest_business_date(daily_df, day_totals) or latest_date
+    latest_customers = 0
+    latest_customers_row = day_totals[day_totals["date"] == to_ts(business_latest)]
+    if not latest_customers_row.empty:
+        latest_customers = int(latest_customers_row["total_customers"].iloc[0])
+    business_label = business_latest.strftime("%Y/%m/%d")
+    customer_stats = calc_avg_customers_in_period(day_totals, period_start, period_end)
+    customer_trend = build_customer_trend_frame(day_totals, period_start, period_end)
+    trend_df = build_product_trend_frame(
+        daily_df, product_id, start_date=period_start, end_date=period_end
+    )
+    single_item_stats = calc_single_item_sales_stats_in_period(
+        daily_df, product_id, period_start, period_end
+    )
+    sales_trend = trend_df[trend_df["units_sold"] > 0] if not trend_df.empty else trend_df
 
-    r1, r2, r3 = st.columns(3)
-    with r1:
-        st.metric("補正係数", f"×{correction_factor:.2f}")
-    with r2:
-        st.metric("理論需要数", f"{int(predicted_customers * selection_rate * correction_factor):,} 個")
-    with r3:
-        st.metric("推奨発注量", f"{recommended:,} 個")
-
-    st.code(
-        f"推奨発注量 = (予測客数 {predicted_customers:,} × フード選択率 {selection_rate:.4f}) "
-        f"× 補正係数 {correction_factor:.2f} − 現在在庫 {current_stock}\n"
-        f"         = {recommended:,} 個",
-        language="text",
+    tab_sales, tab_customers, tab_charts, tab_order = st.tabs(
+        ["期間分析（販売数）", "店舗客数", "推移グラフ", "発注予測"]
     )
 
-    if recommended > COLD_STORAGE_CAPACITY:
-        st.error(f"推奨発注量が限界収容量（{COLD_STORAGE_CAPACITY:,} 個）を超えています。")
-    elif recommended > COLD_STORAGE_CAPACITY * 0.85:
-        st.warning("収容量の85%を超えています。")
-    else:
-        st.success("収容容量内の推奨発注量です。")
+    with tab_sales:
+        st.caption(f"集計期間: **{period_label}**（{period_stats['days']} 日分の登録データ）")
+        ap1, ap2, ap3 = st.columns(3)
+        with ap1:
+            st.metric(f"平均販売個数", f"{period_stats['avg']:,.1f} 個/日")
+        with ap2:
+            st.metric("期間合計販売数", f"{period_stats['total']:,} 個")
+        with ap3:
+            st.metric("集計日数", f"{period_stats['days']:,} 日")
+        if period_stats["active_days"] < period_stats["days"]:
+            st.caption(
+                f"販売があった日のみの平均: **{period_stats['total'] / period_stats['active_days']:,.1f} 個/日**"
+                f"（{period_stats['active_days']} 日）"
+                if period_stats["active_days"] > 0
+                else "指定期間に販売実績がありません。"
+            )
+
+        st.markdown("##### 曜日別の平均販売個数")
+        if weekday_units.empty:
+            st.info("指定期間の販売データがないため、曜日別の平均を表示できません。")
+        else:
+            wk_chart, wk_table = st.columns([1.5, 1])
+            with wk_chart:
+                st.plotly_chart(
+                    plot_weekday_avg_units(weekday_units, selected_name, period_label),
+                    use_container_width=True,
+                )
+            with wk_table:
+                table_view = weekday_units.copy()
+                table_view["平均販売数"] = table_view["avg_units"].map(lambda v: f"{v:,.1f} 個")
+                table_view["集計日数"] = table_view["days"].map(lambda v: f"{int(v)} 日")
+                table_view["合計"] = table_view["total_units"].map(lambda v: f"{int(v):,} 個")
+                st.dataframe(
+                    table_view[["曜日", "平均販売数", "集計日数", "合計"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            st.caption("各曜日について、指定期間内に登録がある日の販売数の平均です。")
+
+    with tab_customers:
+        st.caption(f"集計期間: **{period_label}**")
+        cp1, cp2, cp3, cp4 = st.columns(4)
+        with cp1:
+            st.metric(f"客数（{business_label}）", f"{latest_customers:,} 人")
+        with cp2:
+            st.metric("平均客数", f"{customer_stats['avg']:,.1f} 人/日")
+        with cp3:
+            st.metric("期間合計客数", f"{customer_stats['total']:,} 人")
+        with cp4:
+            st.metric("集計日数", f"{customer_stats['days']:,} 日")
+        if customer_stats["active_days"] < customer_stats["days"] and customer_stats["active_days"] > 0:
+            st.caption(
+                f"客数が記録された日のみの平均: **{customer_stats['total'] / customer_stats['active_days']:,.1f} 人/日**"
+                f"（{customer_stats['active_days']} 日）"
+            )
+        if customer_trend.empty:
+            st.info("指定期間の客数データがありません。")
+        else:
+            st.plotly_chart(
+                plot_customer_trend(customer_trend, customer_stats["avg"], period_label),
+                use_container_width=True,
+            )
+            st.caption(f"破線は期間平均（**{customer_stats['avg']:,.1f} 人/日**）。")
+
+    with tab_charts:
+        st.caption(f"集計期間: **{period_label}**（販売数・単品売上高の推移）")
+        si1, si2, si3 = st.columns(3)
+        with si1:
+            st.metric(
+                f"平均単品売上高（{period_label}）",
+                f"¥{single_item_stats['avg']:,.0f}",
+            )
+        with si2:
+            st.metric("集計日数", f"{single_item_stats['days']:,} 日")
+        with si3:
+            st.metric("販売あり日数", f"{single_item_stats['active_days']:,} 日")
+
+        c1, c2 = st.columns([1, 1.4])
+        with c1:
+            st.plotly_chart(plot_weekday_comparison(lw_sales, avg_4w, selected_name), use_container_width=True)
+            st.caption(f"過去1か月同曜日平均: **{avg_4w:,.1f} 個**")
+        with c2:
+            if not trend_df.empty:
+                st.plotly_chart(
+                    plot_daily_trend(trend_df, selected_name, period_label),
+                    use_container_width=True,
+                )
+            else:
+                st.info("指定期間の販売数データがありません。")
+
+        st.markdown("##### 単品売上高の推移")
+        if sales_trend.empty:
+            st.info("指定期間に単品売上高を表示できるデータがありません（販売数0の日は除外）。")
+        else:
+            st.plotly_chart(
+                plot_single_item_sales_trend(
+                    sales_trend,
+                    selected_name,
+                    period_label,
+                    float(single_item_stats["avg"]),
+                ),
+                use_container_width=True,
+            )
+            st.caption(
+                "各日の **店舗純売上（税抜）÷ 当該商品の販売数**。破線は期間平均（販売あり日のみ）。"
+            )
+
+    with tab_order:
+        st.caption(f"フード選択率（{period_label}）: **{selection_rate:.2%}** — 対象商品: {selected_name}")
+        fc1, fc2, fc3 = st.columns(3)
+        predicted_customers = fc1.number_input("予測客数", min_value=100, max_value=6000, value=2400, step=50)
+        correction_pct = fc2.slider("天気・イベント補正（%）", -30, 50, 0, key="order_correction_pct")
+        current_stock = fc3.number_input("現在の在庫数（個）", min_value=0, max_value=5000, value=120, step=5)
+
+        correction_factor = 1.0 + correction_pct / 100.0
+        recommended = max(0, int(round(predicted_customers * selection_rate * correction_factor - current_stock)))
+
+        r1, r2, r3 = st.columns(3)
+        with r1:
+            st.metric("補正係数", f"×{correction_factor:.2f}")
+        with r2:
+            st.metric("理論需要数", f"{int(predicted_customers * selection_rate * correction_factor):,} 個")
+        with r3:
+            st.metric("推奨発注量", f"{recommended:,} 個")
+
+        st.code(
+            f"推奨発注量 = (予測客数 {predicted_customers:,} × フード選択率 {selection_rate:.4f}) "
+            f"× 補正係数 {correction_factor:.2f} − 現在在庫 {current_stock}\n"
+            f"         = {recommended:,} 個",
+            language="text",
+        )
+
+        if recommended > COLD_STORAGE_CAPACITY:
+            st.error(f"推奨発注量が限界収容量（{COLD_STORAGE_CAPACITY:,} 個）を超えています。")
+        elif recommended > COLD_STORAGE_CAPACITY * 0.85:
+            st.warning("収容量の85%を超えています。")
+        else:
+            st.success("収容容量内の推奨発注量です。")
 
 
 def main() -> None:
@@ -1183,7 +1575,6 @@ def main() -> None:
         f"""
         <div class="main-title">
             <h1>🍽️ {APP_TITLE}</h1>
-            <p>Square CSV（ルートB）+ 手入力 · ダッシュボード・発注予測 · 日商目安 ¥{DAILY_REVENUE_TARGET:,}+</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1207,25 +1598,29 @@ def main() -> None:
             st.success("データを初期化しました。")
             st.rerun()
 
-    t1, t2, t3, t4, t5 = st.tabs(
-        [
-            "Square CSVアップロード",
-            "日次データ入力",
-            "過去データ確認・修正",
-            "商品・紐づけ設定",
-            "ダッシュボード・可視化",
-        ]
-    )
-    with t1:
-        render_square_upload_tab(products_df, daily_df)
-    with t2:
-        render_daily_input_tab(products_df, daily_df)
-    with t3:
+        st.divider()
+        st.markdown("### 設定・修正")
+        side_view = st.radio(
+            "表示する画面",
+            [
+                "メイン（CSV・ダッシュボード）",
+                "過去データの確認・修正",
+                "商品・紐づけ設定",
+            ],
+            label_visibility="collapsed",
+            key="sidebar_view",
+        )
+
+    if side_view == "過去データの確認・修正":
         render_history_tab(products_df, daily_df)
-    with t4:
+    elif side_view == "商品・紐づけ設定":
         render_products_mappings_tab(products_df)
-    with t5:
-        render_dashboard_tab(products_df, daily_df)
+    else:
+        t_csv, t_dash = st.tabs(["Square CSVアップロード", "ダッシュボード・可視化"])
+        with t_csv:
+            render_square_upload_tab(products_df, daily_df)
+        with t_dash:
+            render_dashboard_tab(products_df, daily_df)
 
 
 if __name__ == "__main__":
