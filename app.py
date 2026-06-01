@@ -329,6 +329,13 @@ def allocate_product_sales_from_store(
     }
 
 
+def calc_single_item_sales_indicator(store_total_sales: int, units_sold: int) -> int:
+    """単品売上高 = その日の店舗総売上 ÷ 当該商品の販売個数。"""
+    if units_sold <= 0 or store_total_sales <= 0:
+        return 0
+    return int(store_total_sales / units_sold)
+
+
 def get_product_line_sales(
     daily_df: pd.DataFrame,
     target_date: date,
@@ -1029,12 +1036,11 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
 
     latest_row = product_df[product_df["date"] == to_ts(latest_date)]
     latest_units = int(latest_row["units_sold"].iloc[0]) if not latest_row.empty else 0
-    product_line_sales = get_product_line_sales(daily_df, latest_date, product_id, selected_name)
     day_total_sales = 0
     day_rows = daily_df[daily_df["date"] == to_ts(latest_date)]
     if not day_rows.empty:
         day_total_sales = int(day_rows["total_sales"].iloc[0])
-    store_share = (product_line_sales / day_total_sales) if day_total_sales > 0 else 0.0
+    single_item_sales = calc_single_item_sales_indicator(day_total_sales, latest_units)
 
     lw_sales = last_week_same_day_sales(daily_df, product_id, latest_date)
     avg_4w = four_week_same_weekday_avg(daily_df, product_id, latest_date)
@@ -1042,14 +1048,14 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
 
     latest_label = latest_date.strftime("%Y/%m/%d")
     st.caption(
-        f"単品売上高＝その日の当該商品の売上（¥）。"
-        f" 店舗総売上 ¥{day_total_sales:,} のうち **{store_share:.1%}**（{latest_label}）。"
+        f"単品売上高 ＝ 店舗総売上（¥{day_total_sales:,}）÷ 販売数（{latest_units:,}個）"
+        f" ＝ **¥{single_item_sales:,}**（{latest_label}）"
     )
     m1, m2, m3, m4 = st.columns(4)
     with m1:
-        st.metric(f"単品売上高（{latest_label}）", f"¥{product_line_sales:,}")
+        st.metric(f"単品売上高（{latest_label}）", f"¥{single_item_sales:,}")
     with m2:
-        st.metric("店舗売上に占める割合", f"{store_share:.1%}")
+        st.metric(f"店舗総売上（{latest_label}）", f"¥{day_total_sales:,}")
     with m3:
         st.metric(f"販売数（{latest_label}）", f"{latest_units:,} 個")
     with m4:
