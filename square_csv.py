@@ -84,6 +84,7 @@ class DayImport:
     total_sales: int
     total_customers: int
     units_by_product: dict[str, int]
+    product_sales_by_product: dict[str, int] | None = None
 
 
 @dataclass
@@ -496,7 +497,7 @@ def summarize_square_row_mapping(df: pd.DataFrame, products_df: pd.DataFrame) ->
 
 def parse_matrix_units_by_day(
     df: pd.DataFrame, products_df: pd.DataFrame
-) -> tuple[dict[date, dict[str, int]], dict[date, float], list[str]]:
+) -> tuple[dict[date, dict[str, int]], dict[date, dict[str, int]], dict[date, float], list[str]]:
     warnings = ["商品別マトリックスCSVを読み込みました。"]
     prepared = prepare_square_dataframe(df)
     if not is_matrix_format_df(prepared):
@@ -508,12 +509,14 @@ def parse_matrix_units_by_day(
     product_names = products_df["name"].astype(str).tolist()
     price_map = dict(zip(products_df["name"], products_df["unit_price"]))
     units_by_day: dict[date, dict[str, int]] = {}
+    product_sales_by_day: dict[date, dict[str, int]] = {}
     revenue_by_day: dict[date, float] = {}
     used_yen = False
     unmapped_labels: set[str] = set()
 
     for day_val, day_group in long_df.groupby("date"):
         units = {name: 0 for name in product_names}
+        sales = {name: 0 for name in product_names}
         day_revenue = 0.0
         for _, row in day_group.iterrows():
             label = str(row["product_name"])
@@ -526,14 +529,18 @@ def parse_matrix_units_by_day(
             unit_price = int(price_map.get(matched, 0) or 0)
             if bool(row.get("is_revenue", False)):
                 used_yen = True
+                line_sales = raw
                 day_revenue += raw
                 add_units = max(0, round(raw / unit_price)) if unit_price > 0 else 0
             else:
                 add_units = raw
-                day_revenue += raw * unit_price
+                line_sales = raw * unit_price
+                day_revenue += line_sales
             units[matched] = units.get(matched, 0) + add_units
+            sales[matched] = sales.get(matched, 0) + int(line_sales)
         if sum(units.values()) > 0 or day_revenue > 0:
             units_by_day[day_val] = units
+            product_sales_by_day[day_val] = sales
             revenue_by_day[day_val] = max(day_revenue, 1.0)
 
     if used_yen:
@@ -542,7 +549,7 @@ def parse_matrix_units_by_day(
         sample = "、".join(sorted(unmapped_labels)[:6])
         warnings.append(f"未紐づけのSquare行: {sample}（他{max(0, len(unmapped_labels) - 6)}件）")
     warnings.append(f"商品別CSVから有効な営業日: {len(units_by_day)}日（販売ゼロのみの列は除外）")
-    return units_by_day, revenue_by_day, warnings
+    return units_by_day, product_sales_by_day, revenue_by_day, warnings
 
 
 def build_datetime_series(work: pd.DataFrame, date_col: str, time_col: str | None) -> pd.Series:
@@ -727,6 +734,7 @@ def merge_dual_csv_imports(
     units_by_day: dict[date, dict[str, int]],
     summary_by_day: dict[date, DaySummary],
     products_df: pd.DataFrame,
+    product_sales_by_day: dict[date, dict[str, int]] | None = None,
 ) -> tuple[list[DayImport], list[str]]:
     warnings = ["ルートB: 2枚のCSVを日付で結合しました。"]
     product_names = products_df["name"].astype(str).tolist()
@@ -762,7 +770,8 @@ def merge_dual_csv_imports(
         if not is_meaningful_day(units, day_summary):
             skipped += 1
             continue
-        imports.append(DayImport(day_val, total_sales, total_customers, units))
+        sales = (product_sales_by_day or {}).get(day_val, {name: 0 for name in product_names})
+        imports.append(DayImport(day_val, total_sales, total_customers, units, sales))
     if skipped:
         warnings.append(
             f"販売ゼロかつ売上・客数が極小の日 {skipped}日は除外しました（CSVに無い幽霊日の防止）。"
@@ -792,15 +801,17 @@ def parse_dual_csv_upload(uploaded_files: list[Any], products_df: pd.DataFrame) 
     if len(classified) == 1:
         _fname, df, kind = classified[0]
         if kind == "product_matrix":
-            units, weights, w = parse_matrix_units_by_day(df, products_df)
+            units, sales_by_day, _weights, w = parse_matrix_units_by_day(df, products_df)
             product_names = products_df["name"].astype(str).tolist()
             price_map = dict(zip(products_df["name"], products_df["unit_price"]))
             imports = [
                 DayImport(
                     d,
-                    int(sum(units[d].get(n, 0) * int(price_map.get(n, 0)) for n in product_names)),
+                    int(sum(sales_by_day.get(d, {}).values()))
+                    or int(sum(units[d].get(n, 0) * int(price_map.get(n, 0)) for n in product_names)),
                     max(100, int(sum(units[d].values()) / 0.12)) if sum(units[d].values()) > 0 else 0,
                     units[d],
+                    sales_by_day.get(d, {}),
                 )
                 for d in sorted(units)
             ]
@@ -813,7 +824,7 @@ def parse_dual_csv_upload(uploaded_files: list[Any], products_df: pd.DataFrame) 
     if not product_file or not summary_file:
         kinds = ", ".join(f"{x[0]}→{x[2]}" for x in classified)
         raise ValueError(f"2枚の内訳を認識できませんでした。（判定: {kinds}）")
-    units_by_day, revenue_by_day, w1 = parse_matrix_units_by_day(product_file[1], products_df)
+    units_by_day, sales_by_day, revenue_by_day, w1 = parse_matrix_units_by_day(product_file[1], products_df)
     summary_by_day, w2 = parse_sales_summary_csv(summary_file[1], daily_weights=revenue_by_day)
-    imports, w3 = merge_dual_csv_imports(units_by_day, summary_by_day, products_df)
+    imports, w3 = merge_dual_csv_imports(units_by_day, summary_by_day, products_df, sales_by_day)
     return imports, w1 + w2 + w3

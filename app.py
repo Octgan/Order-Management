@@ -67,6 +67,7 @@ DAILY_SALES_COLUMNS = [
     "product_name",
     "unit_price",
     "units_sold",
+    "product_sales",
     "created_at",
 ]
 
@@ -308,9 +309,49 @@ def load_daily_sales() -> pd.DataFrame:
         return df
     df["date"] = pd.to_datetime(df["date"], format="mixed", errors="coerce")
     df = df.dropna(subset=["date"]).copy()
-    for col in ["total_sales", "total_customers", "unit_price", "units_sold"]:
+    for col in ["total_sales", "total_customers", "unit_price", "units_sold", "product_sales"]:
+        if col not in df.columns:
+            df[col] = 0
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
     return df
+
+
+def allocate_product_sales_from_store(
+    total_sales: int, units_by_product: dict[str, int]
+) -> dict[str, int]:
+    """手入力時: 店舗総売上を登録フードの販売数比率で按分。"""
+    total_units = sum(units_by_product.values())
+    if total_sales <= 0 or total_units <= 0:
+        return {name: 0 for name in units_by_product}
+    return {
+        name: int(total_sales * units / total_units)
+        for name, units in units_by_product.items()
+    }
+
+
+def get_product_line_sales(
+    daily_df: pd.DataFrame,
+    target_date: date,
+    product_id: str,
+    product_name: str,
+) -> int:
+    """その日の当該商品売上（¥）。保存値がなければ店舗売上を販売数比率で按分。"""
+    target_ts = to_ts(target_date)
+    day_rows = daily_df[daily_df["date"] == target_ts]
+    if day_rows.empty:
+        return 0
+    row = day_rows[day_rows["product_id"] == product_id]
+    if row.empty:
+        return 0
+    stored = int(row["product_sales"].iloc[0]) if "product_sales" in row.columns else 0
+    if stored > 0:
+        return stored
+    total_sales = int(day_rows["total_sales"].iloc[0])
+    units = int(row["units_sold"].iloc[0])
+    all_units = int(day_rows["units_sold"].sum())
+    if total_sales > 0 and all_units > 0:
+        return int(total_sales * units / all_units)
+    return 0
 
 
 def save_daily_input(
@@ -319,6 +360,7 @@ def save_daily_input(
     total_customers: int,
     units_by_product: dict[str, int],
     products_df: pd.DataFrame,
+    product_sales_by_product: dict[str, int] | None = None,
 ) -> None:
     daily_df = load_daily_sales()
     target_ts = to_ts(target_date)
@@ -326,6 +368,9 @@ def save_daily_input(
 
     if not daily_df.empty:
         daily_df = daily_df[daily_df["date"] != target_ts]
+
+    if product_sales_by_product is None:
+        product_sales_by_product = allocate_product_sales_from_store(total_sales, units_by_product)
 
     rows = []
     for _, row in products_df.iterrows():
@@ -339,6 +384,7 @@ def save_daily_input(
                 "product_name": name,
                 "unit_price": int(row["unit_price"]),
                 "units_sold": int(units_by_product.get(name, 0)),
+                "product_sales": int(product_sales_by_product.get(name, 0)),
                 "created_at": now,
             }
         )
@@ -447,7 +493,20 @@ def bulk_import_days(imports: list[DayImport], products_df: pd.DataFrame, overwr
         else:
             created += 1
         units = {name: day_data.units_by_product.get(name, 0) for name in product_list["name"].astype(str)}
-        save_daily_input(day_data.day, day_data.total_sales, day_data.total_customers, units, product_list)
+        sales = {}
+        if day_data.product_sales_by_product:
+            sales = {
+                name: day_data.product_sales_by_product.get(name, 0)
+                for name in product_list["name"].astype(str)
+            }
+        save_daily_input(
+            day_data.day,
+            day_data.total_sales,
+            day_data.total_customers,
+            units,
+            product_list,
+            product_sales_by_product=sales or None,
+        )
 
     return created, updated
 
@@ -959,7 +1018,6 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
     selected_name = st.selectbox("対象フード商品", product_list["name"].tolist(), key="dashboard_product")
     selected = product_list[product_list["name"] == selected_name].iloc[0]
     product_id = selected["product_id"]
-    unit_price = int(selected["unit_price"])
 
     product_df = daily_df[daily_df["product_id"] == product_id]
     latest_date = get_latest_product_sales_date(daily_df, product_id) or get_latest_business_date(
@@ -971,22 +1029,32 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
 
     latest_row = product_df[product_df["date"] == to_ts(latest_date)]
     latest_units = int(latest_row["units_sold"].iloc[0]) if not latest_row.empty else 0
-    single_revenue = latest_units * unit_price
+    product_line_sales = get_product_line_sales(daily_df, latest_date, product_id, selected_name)
+    day_total_sales = 0
+    day_rows = daily_df[daily_df["date"] == to_ts(latest_date)]
+    if not day_rows.empty:
+        day_total_sales = int(day_rows["total_sales"].iloc[0])
+    store_share = (product_line_sales / day_total_sales) if day_total_sales > 0 else 0.0
 
     lw_sales = last_week_same_day_sales(daily_df, product_id, latest_date)
     avg_4w = four_week_same_weekday_avg(daily_df, product_id, latest_date)
     selection_rate = calc_food_selection_rate(daily_df, product_id, day_totals, days=7)
 
     latest_label = latest_date.strftime("%Y/%m/%d")
+    st.caption(
+        f"単品売上高＝その日の当該商品の売上（¥）。"
+        f" 店舗総売上 ¥{day_total_sales:,} のうち **{store_share:.1%}**（{latest_label}）。"
+    )
     m1, m2, m3, m4 = st.columns(4)
     with m1:
-        st.metric(f"単品売上高（{latest_label}）", f"¥{single_revenue:,}")
+        st.metric(f"単品売上高（{latest_label}）", f"¥{product_line_sales:,}")
     with m2:
-        st.metric(f"販売数（{latest_label}）", f"{latest_units:,} 個")
+        st.metric("店舗売上に占める割合", f"{store_share:.1%}")
     with m3:
-        st.metric("前週同曜日販売数", f"{lw_sales:,} 個")
+        st.metric(f"販売数（{latest_label}）", f"{latest_units:,} 個")
     with m4:
-        st.metric("フード選択率（直近7日）", f"{selection_rate:.2%}")
+        st.metric("前週同曜日販売数", f"{lw_sales:,} 個")
+    st.metric("フード選択率（直近7日）", f"{selection_rate:.2%}")
 
     c1, c2 = st.columns([1, 1.4])
     with c1:
