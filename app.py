@@ -20,6 +20,7 @@ from square_csv import (
     DayImport,
     load_uploaded_dataframe,
     parse_dual_csv_upload,
+    summarize_square_row_mapping,
 )
 
 # ---------------------------------------------------------------------------
@@ -472,8 +473,27 @@ def render_square_upload_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) 
         }
         for d in imports
     ]
-    st.markdown("#### 取り込みプレビュー")
+    st.markdown("#### 取り込みプレビュー（日別）")
     st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+
+    product_file = next((f for f in files if load_uploaded_dataframe(f, products_df)[0] == "product_matrix"), None)
+    if product_file is not None:
+        _kind, product_df_raw = load_uploaded_dataframe(product_file, products_df)
+        mapping_df = summarize_square_row_mapping(product_df_raw, products_df)
+        if not mapping_df.empty:
+            st.markdown("#### 商品名の紐づけ確認（Square → アプリ）")
+            st.caption(
+                "「パイ」などはバリエーション列（ミート／レモンクリーム）と組み合わせて判定します。"
+                " 未紐づけがある場合は取り込み前にご確認ください。"
+            )
+            st.dataframe(mapping_df, use_container_width=True, hide_index=True)
+
+        last_import = imports[-1]
+        st.markdown(f"#### 最終日（{last_import.day}）の8品目プレビュー")
+        unit_preview = pd.DataFrame(
+            [{"商品": k, "販売数": v} for k, v in last_import.units_by_product.items()]
+        )
+        st.dataframe(unit_preview, use_container_width=True, hide_index=True)
 
     existing_dates = set(daily_df["date"].dt.date.tolist()) if not daily_df.empty else set()
     overlap = [d.day for d in imports if d.day in existing_dates]

@@ -26,6 +26,20 @@ COLUMN_ALIASES: dict[str, list[str]] = {
 MATRIX_ITEM_ALIASES = COLUMN_ALIASES["item"] + ["カテゴリ", "category", "種別", "分類"]
 SKIP_ROW_KEYWORDS = ["合計", "総計", "小計", "total", "subtotal", "カテゴリ合計"]
 
+VARIATION_COLUMN_ALIASES = [
+    "商品バリエーション",
+    "バリエーション",
+    "variation",
+    "item variation",
+    "variant",
+    "オプション",
+]
+
+# 単体では誤マッチしやすい Square 商品名（バリエーション列との組み合わせで判定）
+GENERIC_ITEM_NAMES = {"パイ", "ケーキ", "コーヒー", "ラテ", "ティー"}
+
+SKIP_VARIATION_VALUES = {"", "nan", "none", "定価", "regular", "default", "標準"}
+
 PRODUCT_NAME_ALIASES: dict[str, list[str]] = {
     "パフェ": ["ワッフル パフェ", "ワッフル　パフェ"],
     "ワッフル": ["リエージュワッフル"],
@@ -38,8 +52,16 @@ PRODUCT_NAME_ALIASES: dict[str, list[str]] = {
         "レモン ケーキ",
         "レモンパウンド",
     ],
-    "ミートパイ": ["ミートパイ", "ミート パイ", "Meat Pie"],
-    "レモンパイ": ["レモンパイ", "レモン パイ", "Lemon Pie"],
+    # Square: 商品名=「パイ」+ バリエーションで区別
+    "ミートパイ": ["パイ ミート", "ミートパイ", "ミート パイ", "パイ ミートパイ"],
+    "レモンパイ": [
+        "パイ レモンクリーム",
+        "レモンクリーム",
+        "レモンパイ",
+        "レモン パイ",
+        "パイ レモン",
+        "レモンクリームパイ",
+    ],
 }
 
 KV_CUSTOMER_METRIC_LABELS = ["売上取引履歴", "総売上取引履歴", "受取合計額の取引履歴"]
@@ -199,6 +221,21 @@ def normalize_product_label(name: str) -> str:
     return s
 
 
+def find_variation_column(columns: list[str]) -> str | None:
+    return find_column(columns, VARIATION_COLUMN_ALIASES)
+
+
+def build_square_product_label(item_name: str, variation: str = "") -> str:
+    """Squareの「商品名」+「バリエーション」を1つの照合用文字列にする。"""
+    item = str(item_name).strip()
+    var = str(variation).strip()
+    if not item or item.lower() == "nan":
+        return ""
+    if not var or var.lower() in SKIP_VARIATION_VALUES:
+        return item
+    return f"{item} {var}"
+
+
 def match_product_name(raw_name: str, product_names: list[str]) -> str | None:
     name = str(raw_name).strip()
     if not name:
@@ -222,9 +259,13 @@ def match_product_name(raw_name: str, product_names: list[str]) -> str | None:
         if name == pattern or pattern in name or (norm_pattern and norm_pattern in norm_name):
             return catalog
 
+    item_only = name.split()[0] if " " not in name else None
     for pn in sorted(product_names, key=len, reverse=True):
         norm_pn = normalize_product_label(pn)
-        if pn in name or name in pn or (norm_pn and norm_pn in norm_name):
+        if pn in name or (norm_pn and norm_pn in norm_name):
+            return pn
+        # 「パイ」→「ミートパイ」誤爆を防ぐ: 短いCSV名が長い登録名に含まれるだけの一致は禁止
+        if name in pn and item_only not in GENERIC_ITEM_NAMES and len(name) >= 4:
             return pn
     return None
 
@@ -316,20 +357,64 @@ def is_sales_metric_label(label: str) -> bool:
 def matrix_to_long_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     cols = [str(c) for c in df.columns]
     item_col = find_matrix_item_column(cols)
+    var_col = find_variation_column(cols)
     date_cols = get_matrix_date_columns(cols)
     if not item_col or not date_cols:
         raise ValueError("マトリックス形式の列構成を認識できませんでした。")
-    long_df = df[[item_col] + date_cols].copy()
-    long_df = long_df.melt(id_vars=[item_col], value_vars=date_cols, var_name="_date_col", value_name="quantity")
+    id_cols = [item_col] + ([var_col] if var_col else [])
+    long_df = df[id_cols + date_cols].copy()
+    long_df = long_df.melt(id_vars=id_cols, value_vars=date_cols, var_name="_date_col", value_name="quantity")
     long_df["date"] = long_df["_date_col"].apply(lambda x: parse_column_as_date(str(x)))
     long_df = long_df.dropna(subset=["date"])
-    long_df["product_name"] = long_df[item_col].astype(str).str.strip()
+    if var_col:
+        long_df["product_name"] = long_df.apply(
+            lambda r: build_square_product_label(r[item_col], r[var_col]),
+            axis=1,
+        )
+    else:
+        long_df["product_name"] = long_df[item_col].astype(str).str.strip()
     parsed = long_df["quantity"].apply(parse_matrix_cell)
     long_df["quantity"] = parsed.apply(lambda x: x[0])
     long_df["is_revenue"] = parsed.apply(lambda x: x[1])
     long_df = long_df[long_df["product_name"].astype(str).str.len() > 0]
     long_df = long_df[~long_df["product_name"].apply(is_summary_row_label)]
     return long_df[["date", "product_name", "quantity", "is_revenue"]]
+
+
+def summarize_square_row_mapping(df: pd.DataFrame, products_df: pd.DataFrame) -> pd.DataFrame:
+    """CSV各行がどの登録商品に紐づくか一覧（取り込み前の確認用）。"""
+    prepared = prepare_square_dataframe(df)
+    if not is_matrix_format_df(prepared):
+        return pd.DataFrame()
+    product_names = products_df["name"].astype(str).tolist()
+    cols = [str(c) for c in prepared.columns]
+    item_col = find_matrix_item_column(cols)
+    var_col = find_variation_column(cols)
+    date_cols = get_matrix_date_columns(cols)
+    rows_out: list[dict[str, Any]] = []
+    for _, row in prepared.iterrows():
+        item = str(row[item_col]).strip()
+        if not item or is_summary_row_label(item):
+            continue
+        variation = str(row[var_col]).strip() if var_col else ""
+        label = build_square_product_label(item, variation)
+        matched = match_product_name(label, product_names)
+        period_total = 0
+        for dcol in date_cols:
+            raw, is_rev = parse_matrix_cell(row[dcol])
+            period_total += raw
+        if period_total == 0:
+            continue
+        rows_out.append(
+            {
+                "Square商品名": item,
+                "バリエーション": variation if variation and variation.lower() not in SKIP_VARIATION_VALUES else "—",
+                "照合キー": label,
+                "アプリ商品": matched or "（未紐づけ）",
+                "期間合計": period_total,
+            }
+        )
+    return pd.DataFrame(rows_out)
 
 
 def parse_matrix_units_by_day(
@@ -348,13 +433,17 @@ def parse_matrix_units_by_day(
     units_by_day: dict[date, dict[str, int]] = {}
     revenue_by_day: dict[date, float] = {}
     used_yen = False
+    unmapped_labels: set[str] = set()
 
     for day_val, day_group in long_df.groupby("date"):
         units = {name: 0 for name in product_names}
         day_revenue = 0.0
         for _, row in day_group.iterrows():
-            matched = match_product_name(row["product_name"], product_names)
+            label = str(row["product_name"])
+            matched = match_product_name(label, product_names)
             if not matched:
+                if int(row["quantity"]) != 0:
+                    unmapped_labels.add(label)
                 continue
             raw = int(row["quantity"])
             unit_price = int(price_map.get(matched, 0) or 0)
@@ -371,6 +460,9 @@ def parse_matrix_units_by_day(
 
     if used_yen:
         warnings.append("セルが金額（¥）表記のため、登録単価から販売数を換算しました。")
+    if unmapped_labels:
+        sample = "、".join(sorted(unmapped_labels)[:6])
+        warnings.append(f"未紐づけのSquare行: {sample}（他{max(0, len(unmapped_labels) - 6)}件）")
     return units_by_day, revenue_by_day, warnings
 
 
