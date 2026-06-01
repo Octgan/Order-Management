@@ -608,6 +608,30 @@ def plot_weekday_comparison(last_week: int, four_week_avg: float, product_name: 
     return fig
 
 
+def build_product_trend_frame(
+    daily_df: pd.DataFrame,
+    product_id: str,
+    *,
+    end_date: date,
+    days: int = 30,
+) -> pd.DataFrame:
+    """日次の販売数・店舗総売上・単品売上高（店舗総売上÷販売数）をまとめる。"""
+    start = to_ts(end_date - timedelta(days=days))
+    product_part = daily_df[
+        (daily_df["product_id"] == product_id) & (daily_df["date"] >= start) & (daily_df["date"] <= to_ts(end_date))
+    ].copy()
+    if product_part.empty:
+        return pd.DataFrame(columns=["date", "units_sold", "total_sales", "single_item_sales"])
+
+    day_totals = get_day_totals(daily_df)
+    merged = product_part.merge(day_totals, on="date", how="left")
+    merged["single_item_sales"] = merged.apply(
+        lambda r: calc_single_item_sales_indicator(int(r["total_sales"]), int(r["units_sold"])),
+        axis=1,
+    )
+    return merged.sort_values("date")
+
+
 def plot_daily_trend(product_df: pd.DataFrame, product_name: str) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(
@@ -620,11 +644,44 @@ def plot_daily_trend(product_df: pd.DataFrame, product_name: str) -> go.Figure:
         )
     )
     fig.update_layout(
-        title=f"{product_name} — 日次販売推移",
+        title=f"{product_name} — 日次販売数推移",
         xaxis_title="日付",
         yaxis_title="販売数（個）",
         template="plotly_white",
-        height=400,
+        height=360,
+        hovermode="x unified",
+    )
+    return fig
+
+
+def plot_single_item_sales_trend(trend_df: pd.DataFrame, product_name: str) -> go.Figure:
+    """単品売上高（店舗総売上÷販売数）の日次推移。"""
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=trend_df["date"],
+            y=trend_df["single_item_sales"],
+            mode="lines+markers",
+            name="単品売上高",
+            line=dict(color="#0f3460", width=3),
+            customdata=np.stack(
+                [trend_df["total_sales"], trend_df["units_sold"]],
+                axis=-1,
+            ),
+            hovertemplate=(
+                "日付: %{x|%Y-%m-%d}<br>"
+                "単品売上高: ¥%{y:,}<br>"
+                "店舗総売上: ¥%{customdata[0]:,}<br>"
+                "販売数: %{customdata[1]:,}個<extra></extra>"
+            ),
+        )
+    )
+    fig.update_layout(
+        title=f"{product_name} — 単品売上高の推移（店舗総売上÷販売数）",
+        xaxis_title="日付",
+        yaxis_title="単品売上高（円）",
+        template="plotly_white",
+        height=360,
         hovermode="x unified",
     )
     return fig
@@ -1062,13 +1119,25 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
         st.metric("前週同曜日販売数", f"{lw_sales:,} 個")
     st.metric("フード選択率（直近7日）", f"{selection_rate:.2%}")
 
+    trend_df = build_product_trend_frame(daily_df, product_id, end_date=latest_date, days=30)
+
     c1, c2 = st.columns([1, 1.4])
     with c1:
         st.plotly_chart(plot_weekday_comparison(lw_sales, avg_4w, selected_name), use_container_width=True)
         st.caption(f"過去1か月同曜日平均: **{avg_4w:,.1f} 個**")
     with c2:
-        trend_df = product_df[product_df["date"] >= to_ts(latest_date - timedelta(days=30))]
-        st.plotly_chart(plot_daily_trend(trend_df, selected_name), use_container_width=True)
+        if not trend_df.empty:
+            st.plotly_chart(plot_daily_trend(trend_df, selected_name), use_container_width=True)
+        else:
+            st.info("グラフ表示に必要な日次データがありません。")
+
+    st.markdown('<p class="section-title">単品売上高の推移</p>', unsafe_allow_html=True)
+    sales_trend = trend_df[trend_df["units_sold"] > 0] if not trend_df.empty else trend_df
+    if sales_trend.empty:
+        st.info("単品売上高のグラフを表示するデータがありません。")
+    else:
+        st.plotly_chart(plot_single_item_sales_trend(sales_trend, selected_name), use_container_width=True)
+        st.caption("各日の **店舗総売上 ÷ 当該商品の販売数**（直近30日・販売数0の日は除外）。")
 
     st.markdown('<p class="section-title">発注予測シミュレーター</p>', unsafe_allow_html=True)
     fc1, fc2, fc3 = st.columns(3)
