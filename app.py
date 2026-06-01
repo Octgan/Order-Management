@@ -28,7 +28,7 @@ from square_csv import (
 APP_TITLE = "Square CSV連携 フード発注管理"
 DAILY_REVENUE_TARGET = 1_000_000
 COLD_STORAGE_CAPACITY = 300
-DATA_VERSION = 2  # 仕様変更時に上げると data/ を初期化
+DATA_VERSION = 3  # 仕様変更時に上げると data/ を初期化
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 PRODUCTS_CSV = DATA_DIR / "products.csv"
@@ -36,15 +36,14 @@ DAILY_CSV = DATA_DIR / "daily_sales.csv"
 VERSION_FILE = DATA_DIR / ".data_version"
 
 DEFAULT_PRODUCTS: list[dict[str, Any]] = [
-    {"name": "ハニー＆シトラス", "unit_price": 800},
-    {"name": "フルーツ＆ナッツ", "unit_price": 800},
-    {"name": "羊羹", "unit_price": 400},
-    {"name": "羊羹 みかん", "unit_price": 450},
-    {"name": "羊羹 テリーヌ", "unit_price": 500},
-    {"name": "羊羹 抹茶", "unit_price": 450},
     {"name": "ワッフル", "unit_price": 900},
     {"name": "パフェ", "unit_price": 1250},
+    {"name": "抹茶ケーキ", "unit_price": 850},
     {"name": "チーズケーキ", "unit_price": 780},
+    {"name": "バナナパウンドケーキ", "unit_price": 720},
+    {"name": "レモンケーキ", "unit_price": 720},
+    {"name": "ミートパイ", "unit_price": 650},
+    {"name": "レモンパイ", "unit_price": 650},
 ]
 
 EMPTY_DATA_MESSAGE = (
@@ -431,7 +430,7 @@ def render_square_upload_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) 
         if is_daily_data_empty(daily_df):
             st.info(EMPTY_DATA_MESSAGE)
             st.markdown(
-                "1. **商品別**の横持ちCSV（9フード品目の日別販売数・売上）  \n"
+                "1. **商品別**の横持ちCSV（8フード品目の日別販売数・売上）  \n"
                 "2. **売上サマリー**のCSV（日別の総客数・店舗総売上）  \n"
                 "3. 2枚をまとめてドラッグ＆ドロップ → プレビュー確認 → 「データを一括取り込み」"
             )
@@ -566,7 +565,7 @@ def render_daily_input_form(
 
 
 def render_daily_input_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> None:
-    st.caption("iPadなどから毎日の売上・客数・9品目の販売数を入力してください。同じ日付で保存すると上書きされます。")
+    st.caption("iPadなどから毎日の売上・客数・8品目の販売数を入力してください。同じ日付で保存すると上書きされます。")
     render_daily_input_form(
         products_df,
         daily_df,
