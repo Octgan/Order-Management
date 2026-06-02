@@ -321,16 +321,27 @@ def sync_inventory_products(products_df: pd.DataFrame) -> None:
         inv.to_csv(INVENTORY_CSV, index=False, encoding="utf-8-sig")
 
 
+def _coerce_inventory_text_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """CSVの空欄が float/NaN になる列を文字列に揃える（'' 代入エラー防止）。"""
+    for col in ("delivery_weekdays", "delivery_by_weekday", "delivery_by_weekday_parity", "updated_at"):
+        if col not in df.columns:
+            df[col] = ""
+        else:
+            df[col] = df[col].fillna("").astype(str).replace("nan", "", regex=False)
+    return df
+
+
 def load_inventory_df() -> pd.DataFrame:
     if not INVENTORY_CSV.exists() or INVENTORY_CSV.stat().st_size == 0:
         return pd.DataFrame(columns=INVENTORY_COLUMNS)
-    df = pd.read_csv(INVENTORY_CSV, encoding="utf-8-sig")
+    df = pd.read_csv(INVENTORY_CSV, encoding="utf-8-sig", dtype=str, keep_default_na=False)
     for col in INVENTORY_COLUMNS:
         if col not in df.columns:
             if col in ("delivery_weekdays", "delivery_by_weekday", "delivery_by_weekday_parity"):
                 df[col] = ""
             else:
-                df[col] = 0
+                df[col] = "0" if col != "updated_at" else ""
+    df = _coerce_inventory_text_columns(df)
     df["current_stock"] = pd.to_numeric(df["current_stock"], errors="coerce").fillna(0).astype(int)
     df["safety_stock"] = pd.to_numeric(df["safety_stock"], errors="coerce").fillna(0).astype(int)
     df["delivery_quantity"] = pd.to_numeric(df["delivery_quantity"], errors="coerce").fillna(0).astype(int)
