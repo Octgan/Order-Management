@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -11,9 +12,23 @@ import pandas as pd
 DATA_DIR = Path(__file__).resolve().parent / "data"
 INVENTORY_CSV = DATA_DIR / "inventory.csv"
 DELIVERIES_CSV = DATA_DIR / "inventory_deliveries.csv"
+CONSUMPTION_PLAN_CSV = DATA_DIR / "inventory_consumption_plan.csv"
+DELIVERY_PLAN_CSV = DATA_DIR / "inventory_delivery_plan.csv"
 
-INVENTORY_COLUMNS = ["product_id", "product_name", "current_stock", "safety_stock", "updated_at"]
+INVENTORY_COLUMNS = [
+    "product_id",
+    "product_name",
+    "current_stock",
+    "safety_stock",
+    "delivery_weekdays",
+    "delivery_quantity",
+    "delivery_by_weekday",
+    "delivery_by_weekday_parity",
+    "updated_at",
+]
 DELIVERY_COLUMNS = ["delivery_id", "product_id", "delivery_date", "quantity", "memo", "created_at"]
+CONSUMPTION_PLAN_COLUMNS = ["product_id", "plan_date", "planned_use", "updated_at"]
+DELIVERY_PLAN_COLUMNS = ["product_id", "plan_date", "delivery_qty", "updated_at"]
 
 WEEKDAY_LABELS_JA = ["月", "火", "水", "木", "金", "土", "日"]
 
@@ -34,6 +49,10 @@ def init_inventory_csv(products_df: pd.DataFrame) -> None:
             "product_name": str(row["name"]),
             "current_stock": 0,
             "safety_stock": 10,
+            "delivery_weekdays": "",
+            "delivery_quantity": 0,
+            "delivery_by_weekday": "",
+            "delivery_by_weekday_parity": "",
             "updated_at": now,
         }
         for _, row in products_df.iterrows()
@@ -48,31 +67,257 @@ def init_deliveries_csv() -> None:
         pd.DataFrame(columns=DELIVERY_COLUMNS).to_csv(DELIVERIES_CSV, index=False, encoding="utf-8-sig")
 
 
+def init_consumption_plan_csv() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not CONSUMPTION_PLAN_CSV.exists() or CONSUMPTION_PLAN_CSV.stat().st_size == 0:
+        pd.DataFrame(columns=CONSUMPTION_PLAN_COLUMNS).to_csv(
+            CONSUMPTION_PLAN_CSV, index=False, encoding="utf-8-sig"
+        )
+
+
+def load_consumption_plan_df(product_id: str | None = None) -> pd.DataFrame:
+    if not CONSUMPTION_PLAN_CSV.exists() or CONSUMPTION_PLAN_CSV.stat().st_size == 0:
+        return pd.DataFrame(columns=CONSUMPTION_PLAN_COLUMNS)
+    df = pd.read_csv(CONSUMPTION_PLAN_CSV, encoding="utf-8-sig")
+    df["planned_use"] = pd.to_numeric(df["planned_use"], errors="coerce").fillna(0).astype(int)
+    df["plan_date"] = pd.to_datetime(df["plan_date"], errors="coerce").dt.date
+    if product_id:
+        df = df[df["product_id"].astype(str) == str(product_id)]
+    return df
+
+
+def load_manual_planned_use(
+    product_id: str, start_date: date, end_date: date
+) -> dict[date, int]:
+    df = load_consumption_plan_df(product_id)
+    if df.empty:
+        return {}
+    out: dict[date, int] = {}
+    for _, row in df.iterrows():
+        d = row["plan_date"]
+        if d is None or pd.isna(d):
+            continue
+        if isinstance(d, pd.Timestamp):
+            d = d.date()
+        if start_date <= d <= end_date:
+            out[d] = int(row["planned_use"])
+    return out
+
+
+def save_consumption_plan(product_id: str, planned_by_day: dict[date, int]) -> None:
+    """指定期間の手入力計画消費を保存（0件の日は行を削除）。"""
+    init_consumption_plan_csv()
+    df = load_consumption_plan_df()
+    pid = str(product_id)
+    if not df.empty:
+        drop_days = set(planned_by_day.keys())
+        df = df[~((df["product_id"].astype(str) == pid) & (df["plan_date"].isin(drop_days)))]
+    now = datetime.now().isoformat()
+    new_rows: list[dict[str, Any]] = []
+    for day_val, qty in planned_by_day.items():
+        if qty < 0:
+            continue
+        new_rows.append(
+            {
+                "product_id": pid,
+                "plan_date": day_val.isoformat(),
+                "planned_use": int(qty),
+                "updated_at": now,
+            }
+        )
+    if new_rows:
+        df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
+    if df.empty:
+        init_consumption_plan_csv()
+    else:
+        df.to_csv(CONSUMPTION_PLAN_CSV, index=False, encoding="utf-8-sig")
+
+
+def clear_consumption_plan(product_id: str, start_date: date, end_date: date) -> None:
+    df = load_consumption_plan_df()
+    if df.empty:
+        return
+    pid = str(product_id)
+    mask = (df["product_id"].astype(str) == pid) & (df["plan_date"] >= start_date) & (df["plan_date"] <= end_date)
+    df = df[~mask]
+    if df.empty:
+        init_consumption_plan_csv()
+    else:
+        df.to_csv(CONSUMPTION_PLAN_CSV, index=False, encoding="utf-8-sig")
+
+
+def init_delivery_plan_csv() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not DELIVERY_PLAN_CSV.exists() or DELIVERY_PLAN_CSV.stat().st_size == 0:
+        pd.DataFrame(columns=DELIVERY_PLAN_COLUMNS).to_csv(
+            DELIVERY_PLAN_CSV, index=False, encoding="utf-8-sig"
+        )
+
+
+def load_delivery_plan_df(product_id: str | None = None) -> pd.DataFrame:
+    if not DELIVERY_PLAN_CSV.exists() or DELIVERY_PLAN_CSV.stat().st_size == 0:
+        return pd.DataFrame(columns=DELIVERY_PLAN_COLUMNS)
+    df = pd.read_csv(DELIVERY_PLAN_CSV, encoding="utf-8-sig")
+    df["delivery_qty"] = pd.to_numeric(df["delivery_qty"], errors="coerce").fillna(0).astype(int)
+    df["plan_date"] = pd.to_datetime(df["plan_date"], errors="coerce").dt.date
+    if product_id:
+        df = df[df["product_id"].astype(str) == str(product_id)]
+    return df
+
+
+def load_manual_delivery_plan(
+    product_id: str, start_date: date, end_date: date
+) -> dict[date, int]:
+    df = load_delivery_plan_df(product_id)
+    if df.empty:
+        return {}
+    out: dict[date, int] = {}
+    for _, row in df.iterrows():
+        d = row["plan_date"]
+        if d is None or pd.isna(d):
+            continue
+        if isinstance(d, pd.Timestamp):
+            d = d.date()
+        if start_date <= d <= end_date:
+            out[d] = int(row["delivery_qty"])
+    return out
+
+
+def save_delivery_plan(product_id: str, delivery_by_day: dict[date, int]) -> None:
+    """カレンダーで入力した日別納品数を保存（0は行削除）。"""
+    init_delivery_plan_csv()
+    df = load_delivery_plan_df()
+    pid = str(product_id)
+    if not df.empty:
+        drop_days = set(delivery_by_day.keys())
+        df = df[~((df["product_id"].astype(str) == pid) & (df["plan_date"].isin(drop_days)))]
+    now = datetime.now().isoformat()
+    new_rows: list[dict[str, Any]] = []
+    for day_val, qty in delivery_by_day.items():
+        if int(qty) <= 0:
+            continue
+        new_rows.append(
+            {
+                "product_id": pid,
+                "plan_date": day_val.isoformat(),
+                "delivery_qty": int(qty),
+                "updated_at": now,
+            }
+        )
+    if new_rows:
+        df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
+    if df.empty:
+        init_delivery_plan_csv()
+    else:
+        df.to_csv(DELIVERY_PLAN_CSV, index=False, encoding="utf-8-sig")
+
+
+def clear_delivery_plan(product_id: str, start_date: date, end_date: date) -> None:
+    df = load_delivery_plan_df()
+    if df.empty:
+        return
+    pid = str(product_id)
+    mask = (df["product_id"].astype(str) == pid) & (df["plan_date"] >= start_date) & (df["plan_date"] <= end_date)
+    df = df[~mask]
+    if df.empty:
+        init_delivery_plan_csv()
+    else:
+        df.to_csv(DELIVERY_PLAN_CSV, index=False, encoding="utf-8-sig")
+
+
+def get_delivery_weekdays(product_id: str) -> list[int]:
+    """納品がある曜日（0=月）。数量はカレンダーで入力。"""
+    df = load_inventory_df()
+    row = df[df["product_id"].astype(str) == str(product_id)]
+    if row.empty:
+        return []
+    wds = parse_weekday_list(str(row["delivery_weekdays"].iloc[0]))
+    if wds:
+        return wds
+    parity = parse_delivery_by_weekday_parity(str(row.get("delivery_by_weekday_parity", "").iloc[0]))
+    if parity:
+        return sorted(parity.keys())
+    base = parse_delivery_by_weekday(str(row.get("delivery_by_weekday", "").iloc[0]))
+    return sorted(base.keys()) if base else []
+
+
+def save_delivery_weekdays(product_id: str, weekdays: list[int]) -> None:
+    """納品曜日のみ保存（数量はカレンダー表で入力）。"""
+    cleaned = sorted({int(w) for w in weekdays if 0 <= int(w) <= 6})
+    df = load_inventory_df()
+    pid = str(product_id)
+    now = datetime.now().isoformat()
+    mask = df["product_id"].astype(str) == pid
+    payload = {
+        "delivery_weekdays": format_weekday_list(cleaned),
+        "delivery_quantity": 0,
+        "delivery_by_weekday": "",
+        "delivery_by_weekday_parity": "",
+        "updated_at": now,
+    }
+    if mask.any():
+        for key, val in payload.items():
+            df.loc[mask, key] = val
+    else:
+        df = pd.concat(
+            [
+                df,
+                pd.DataFrame(
+                    [
+                        {
+                            "product_id": pid,
+                            "product_name": "",
+                            "current_stock": 0,
+                            "safety_stock": 10,
+                            **payload,
+                        }
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
+    df.to_csv(INVENTORY_CSV, index=False, encoding="utf-8-sig")
+
+
 def sync_inventory_products(products_df: pd.DataFrame) -> None:
-    """新規商品を在庫マスタに追加。"""
-    if not INVENTORY_CSV.exists():
+    """販売中商品を在庫マスタに反映（新規追加・商品名の更新）。"""
+    if not INVENTORY_CSV.exists() or INVENTORY_CSV.stat().st_size == 0:
         init_inventory_csv(products_df)
         return
     inv = pd.read_csv(INVENTORY_CSV, encoding="utf-8-sig")
     existing = set(inv["product_id"].astype(str))
     now = datetime.now().isoformat()
     new_rows: list[dict[str, Any]] = []
+    changed = False
     for _, row in products_df.iterrows():
         if int(row.get("is_active", 1)) != 1:
             continue
         pid = str(row["product_id"])
+        pname = str(row["name"])
         if pid not in existing:
             new_rows.append(
                 {
                     "product_id": pid,
-                    "product_name": str(row["name"]),
+                    "product_name": pname,
                     "current_stock": 0,
                     "safety_stock": 10,
+                    "delivery_weekdays": "",
+                    "delivery_quantity": 0,
+                    "delivery_by_weekday": "",
+                    "delivery_by_weekday_parity": "",
                     "updated_at": now,
                 }
             )
+        else:
+            mask = inv["product_id"].astype(str) == pid
+            if mask.any() and str(inv.loc[mask, "product_name"].iloc[0]) != pname:
+                inv.loc[mask, "product_name"] = pname
+                inv.loc[mask, "updated_at"] = now
+                changed = True
     if new_rows:
         inv = pd.concat([inv, pd.DataFrame(new_rows)], ignore_index=True)
+        changed = True
+    if changed:
         inv.to_csv(INVENTORY_CSV, index=False, encoding="utf-8-sig")
 
 
@@ -80,9 +325,297 @@ def load_inventory_df() -> pd.DataFrame:
     if not INVENTORY_CSV.exists() or INVENTORY_CSV.stat().st_size == 0:
         return pd.DataFrame(columns=INVENTORY_COLUMNS)
     df = pd.read_csv(INVENTORY_CSV, encoding="utf-8-sig")
+    for col in INVENTORY_COLUMNS:
+        if col not in df.columns:
+            if col in ("delivery_weekdays", "delivery_by_weekday", "delivery_by_weekday_parity"):
+                df[col] = ""
+            else:
+                df[col] = 0
     df["current_stock"] = pd.to_numeric(df["current_stock"], errors="coerce").fillna(0).astype(int)
     df["safety_stock"] = pd.to_numeric(df["safety_stock"], errors="coerce").fillna(0).astype(int)
+    df["delivery_quantity"] = pd.to_numeric(df["delivery_quantity"], errors="coerce").fillna(0).astype(int)
     return df
+
+
+def parse_weekday_list(text: str) -> list[int]:
+    if not str(text).strip():
+        return []
+    out: list[int] = []
+    for part in str(text).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            w = int(part)
+            if 0 <= w <= 6:
+                out.append(w)
+        except ValueError:
+            continue
+    return sorted(set(out))
+
+
+def format_weekday_list(weekdays: list[int]) -> str:
+    return ",".join(str(w) for w in sorted(set(weekdays)))
+
+
+def weekday_labels_text(weekdays: list[int]) -> str:
+    if not weekdays:
+        return "未設定"
+    return "・".join(WEEKDAY_LABELS_JA[w] for w in sorted(weekdays))
+
+
+def parse_delivery_by_weekday(text: str) -> dict[int, int]:
+    raw = str(text).strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return {}
+        out: dict[int, int] = {}
+        for key, val in data.items():
+            w = int(key)
+            q = int(val)
+            if 0 <= w <= 6 and q > 0:
+                out[w] = q
+        return out
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+
+
+def encode_delivery_by_weekday(schedule: dict[int, int]) -> str:
+    filtered = {str(w): int(q) for w, q in schedule.items() if 0 <= w <= 6 and int(q) > 0}
+    return json.dumps(filtered, ensure_ascii=False) if filtered else ""
+
+
+def weekday_schedule_summary(schedule: dict[int, int]) -> str:
+    if not schedule:
+        return "未設定"
+    return " · ".join(f"{WEEKDAY_LABELS_JA[w]}{q}個" for w, q in sorted(schedule.items()))
+
+
+def get_weekday_delivery_schedule(product_id: str) -> dict[int, int]:
+    """曜日ごとの定期納品数。キー=weekday(0=月)。"""
+    df = load_inventory_df()
+    row = df[df["product_id"].astype(str) == str(product_id)]
+    if row.empty:
+        return {}
+    by_wd = parse_delivery_by_weekday(str(row.get("delivery_by_weekday", "").iloc[0]))
+    if by_wd:
+        return by_wd
+    weekdays = parse_weekday_list(str(row["delivery_weekdays"].iloc[0]))
+    qty = int(row["delivery_quantity"].iloc[0])
+    if weekdays and qty > 0:
+        return {w: qty for w in weekdays}
+    return {}
+
+
+def save_weekday_delivery_schedule(product_id: str, schedule: dict[int, int]) -> None:
+    """曜日ごとの納品数を保存。"""
+    cleaned = {int(w): int(q) for w, q in schedule.items() if 0 <= int(w) <= 6 and int(q) > 0}
+    df = load_inventory_df()
+    pid = str(product_id)
+    now = datetime.now().isoformat()
+    mask = df["product_id"].astype(str) == pid
+    payload = {
+        "delivery_by_weekday": encode_delivery_by_weekday(cleaned),
+        "delivery_weekdays": format_weekday_list(list(cleaned.keys())),
+        "delivery_quantity": max(cleaned.values()) if cleaned else 0,
+        "updated_at": now,
+    }
+    if mask.any():
+        for key, val in payload.items():
+            df.loc[mask, key] = val
+    else:
+        df = pd.concat(
+            [
+                df,
+                pd.DataFrame(
+                    [
+                        {
+                            "product_id": pid,
+                            "product_name": "",
+                            "current_stock": 0,
+                            "safety_stock": 10,
+                            **payload,
+                        }
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
+    df.to_csv(INVENTORY_CSV, index=False, encoding="utf-8-sig")
+
+
+def week_parity_iso(d: date) -> int:
+    """ISO週番号の奇数/偶数（1=奇数週, 0=偶数週）。"""
+    return int(d.isocalendar().week % 2)
+
+
+def parse_delivery_by_weekday_parity(text: str) -> dict[int, dict[int, int]]:
+    """
+    例:
+      {"0":{"0":30,"1":40},"3":{"0":0,"1":50}}
+    - weekday: 0=月 ... 6=日
+    - parity: 0=偶数週, 1=奇数週
+    """
+    raw = str(text).strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return {}
+        out: dict[int, dict[int, int]] = {}
+        for wd_key, parity_map in data.items():
+            wd = int(wd_key)
+            if not (0 <= wd <= 6):
+                continue
+            if not isinstance(parity_map, dict):
+                continue
+            even = int(parity_map.get("0", 0) or 0)
+            odd = int(parity_map.get("1", 0) or 0)
+            if even > 0 or odd > 0:
+                out[wd] = {0: max(0, even), 1: max(0, odd)}
+        return out
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+
+
+def encode_delivery_by_weekday_parity(schedule: dict[int, dict[int, int]]) -> str:
+    filtered: dict[str, dict[str, int]] = {}
+    for wd, parity_map in (schedule or {}).items():
+        wd = int(wd)
+        if not (0 <= wd <= 6):
+            continue
+        even = int(parity_map.get(0, 0) or 0)
+        odd = int(parity_map.get(1, 0) or 0)
+        if even <= 0 and odd <= 0:
+            continue
+        filtered[str(wd)] = {"0": max(0, even), "1": max(0, odd)}
+    return json.dumps(filtered, ensure_ascii=False) if filtered else ""
+
+
+def weekday_schedule_parity_summary(schedule: dict[int, dict[int, int]]) -> str:
+    if not schedule:
+        return "未設定"
+    parts: list[str] = []
+    for wd in sorted(schedule.keys()):
+        even_qty = int(schedule[wd].get(0, 0))
+        odd_qty = int(schedule[wd].get(1, 0))
+        if even_qty > 0 and odd_qty > 0:
+            parts.append(f"{WEEKDAY_LABELS_JA[wd]}（偶{even_qty}・奇{odd_qty}）")
+        elif even_qty > 0:
+            parts.append(f"{WEEKDAY_LABELS_JA[wd]}（偶{even_qty}）")
+        elif odd_qty > 0:
+            parts.append(f"{WEEKDAY_LABELS_JA[wd]}（奇{odd_qty}）")
+    return "・".join(parts)
+
+
+def get_weekday_delivery_schedule_parity(product_id: str) -> dict[int, dict[int, int]]:
+    """
+    隔週（偶数週/奇数週）で納品数を変える。
+    戻り値: {weekday: {0:even_qty, 1:odd_qty}}
+    """
+    df = load_inventory_df()
+    row = df[df["product_id"].astype(str) == str(product_id)]
+    if row.empty:
+        return {}
+    parsed = parse_delivery_by_weekday_parity(str(row.get("delivery_by_weekday_parity", "").iloc[0]))
+    if parsed:
+        return parsed
+    # 旧データ互換: delivery_by_weekday を偶/奇に同じ値で展開
+    base = get_weekday_delivery_schedule(product_id)
+    if not base:
+        return {}
+    return {wd: {0: qty, 1: qty} for wd, qty in base.items() if int(qty) > 0}
+
+
+def save_weekday_delivery_schedule_parity(
+    product_id: str,
+    schedule: dict[int, dict[int, int]],
+) -> None:
+    """
+    schedule: {weekday: {0:even_qty, 1:odd_qty}}
+    """
+    df = load_inventory_df()
+    pid = str(product_id)
+    now = datetime.now().isoformat()
+    mask = df["product_id"].astype(str) == pid
+
+    cleaned: dict[int, dict[int, int]] = {}
+    for wd, parity_map in (schedule or {}).items():
+        wd = int(wd)
+        if not (0 <= wd <= 6):
+            continue
+        even = int(parity_map.get(0, 0) or 0)
+        odd = int(parity_map.get(1, 0) or 0)
+        if even <= 0 and odd <= 0:
+            continue
+        cleaned[wd] = {0: max(0, even), 1: max(0, odd)}
+
+    parity_json = encode_delivery_by_weekday_parity(cleaned)
+    # 旧UI/旧互換フィールドも更新しておく（最大値で代表）
+    max_map = {wd: max(int(v.get(0, 0)), int(v.get(1, 0))) for wd, v in cleaned.items()}
+    delivery_weekdays_str = format_weekday_list(list(max_map.keys()))
+    delivery_quantity = max(max_map.values()) if max_map else 0
+    delivery_by_weekday_json = encode_delivery_by_weekday(max_map)
+
+    payload = {
+        "delivery_by_weekday_parity": parity_json,
+        "delivery_weekdays": delivery_weekdays_str,
+        "delivery_quantity": delivery_quantity,
+        "delivery_by_weekday": delivery_by_weekday_json,
+        "updated_at": now,
+    }
+
+    if mask.any():
+        for key, val in payload.items():
+            df.loc[mask, key] = val
+    else:
+        df = pd.concat(
+            [
+                df,
+                pd.DataFrame(
+                    [
+                        {
+                            "product_id": pid,
+                            "product_name": "",
+                            "current_stock": 0,
+                            "safety_stock": 10,
+                            **payload,
+                        }
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
+
+    df.to_csv(INVENTORY_CSV, index=False, encoding="utf-8-sig")
+
+
+def build_combined_delivery_maps(
+    product_id: str,
+    start_date: date,
+    end_date: date,
+    one_off_deliveries: pd.DataFrame | None = None,
+) -> tuple[dict[date, int], dict[date, int], dict[date, int]]:
+    """カレンダー入力（日別）+ 臨時（日付指定）の入荷マップ。total, scheduled, extra。"""
+    scheduled = load_manual_delivery_plan(product_id, start_date, end_date)
+    extra: dict[date, int] = {}
+    if one_off_deliveries is not None and not one_off_deliveries.empty:
+        for _, row in one_off_deliveries.iterrows():
+            d = row["delivery_date"]
+            if isinstance(d, pd.Timestamp):
+                d = d.date()
+            if d is None or pd.isna(d):
+                continue
+            if start_date <= d <= end_date:
+                extra[d] = extra.get(d, 0) + int(row["quantity"])
+    total: dict[date, int] = {}
+    for d in set(scheduled) | set(extra):
+        total[d] = scheduled.get(d, 0) + extra.get(d, 0)
+    return total, scheduled, extra
 
 
 def save_product_inventory(
@@ -112,6 +645,10 @@ def save_product_inventory(
                             "product_name": product_name,
                             "current_stock": int(current_stock),
                             "safety_stock": int(safety_stock),
+                            "delivery_weekdays": "",
+                            "delivery_quantity": 0,
+                            "delivery_by_weekday": "",
+                            "delivery_by_weekday_parity": "",
                             "updated_at": now,
                         }
                     ]
@@ -202,13 +739,10 @@ def build_inventory_projection(
     safety_stock: int = 0,
 ) -> pd.DataFrame:
     """日別の予測消費・入荷・予想在庫を計算（縦型カレンダー用）。"""
-    delivery_map: dict[date, int] = {}
-    if deliveries is not None and not deliveries.empty:
-        for _, row in deliveries.iterrows():
-            d = row["delivery_date"]
-            if isinstance(d, pd.Timestamp):
-                d = d.date()
-            delivery_map[d] = delivery_map.get(d, 0) + int(row["quantity"])
+    end_date = start_date + timedelta(days=horizon_days - 1)
+    delivery_map, scheduled_map, extra_map = build_combined_delivery_maps(
+        product_id, start_date, end_date, deliveries
+    )
 
     rows: list[dict[str, Any]] = []
     stock = int(start_stock)
@@ -217,6 +751,8 @@ def build_inventory_projection(
         predicted = predict_daily_units(daily_df, product_id, day_val)
         use = max(0, int(round(predicted)))
         inbound = int(delivery_map.get(day_val, 0))
+        inbound_scheduled = int(scheduled_map.get(day_val, 0))
+        inbound_extra = int(extra_map.get(day_val, 0))
         stock_after = stock - use + inbound
         weekday = day_val.weekday()
         rows.append(
@@ -226,19 +762,54 @@ def build_inventory_projection(
                 "曜日": WEEKDAY_LABELS_JA[weekday],
                 "label": f"{WEEKDAY_LABELS_JA[weekday]} {day_val.month}/{day_val.day}",
                 "predicted_use": use,
+                "planned_use": use,
                 "delivery": inbound,
+                "delivery_scheduled": inbound_scheduled,
+                "delivery_extra": inbound_extra,
                 "stock_start": stock,
                 "stock_end": stock_after,
                 "is_today": offset == 0,
+                "is_manual": False,
             }
         )
         stock = stock_after
 
     out = pd.DataFrame(rows)
+    return apply_planned_consumption(out, {}, safety_stock)
+
+
+def apply_planned_consumption(
+    projection: pd.DataFrame,
+    manual_by_day: dict[date, int],
+    safety_stock: int,
+) -> pd.DataFrame:
+    """計画消費（手入力含む）で日末在庫・状態を再計算。"""
+    if projection.empty:
+        return projection
+    out = projection.copy()
+    stock = int(out.iloc[0]["stock_start"])
+    for i in range(len(out)):
+        row = out.iloc[i]
+        day_val = row["date"]
+        if isinstance(day_val, pd.Timestamp):
+            day_val = day_val.date()
+        predicted = int(row["predicted_use"])
+        if day_val in manual_by_day:
+            use = max(0, int(manual_by_day[day_val]))
+            out.at[i, "is_manual"] = True
+        else:
+            use = max(0, int(row.get("planned_use", predicted)))
+            out.at[i, "is_manual"] = bool(row.get("is_manual", False))
+        inbound = int(row["delivery"])
+        out.at[i, "planned_use"] = use
+        out.at[i, "stock_start"] = stock
+        stock_after = stock - use + inbound
+        out.at[i, "stock_end"] = stock_after
+        stock = stock_after
+
     out["status"] = "ok"
-    if not out.empty:
-        out.loc[out["stock_end"] < 0, "status"] = "out"
-        out.loc[(out["stock_end"] >= 0) & (out["stock_end"] < int(safety_stock)), "status"] = "low"
+    out.loc[out["stock_end"] < 0, "status"] = "out"
+    out.loc[(out["stock_end"] >= 0) & (out["stock_end"] < int(safety_stock)), "status"] = "low"
     return out
 
 

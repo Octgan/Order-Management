@@ -23,14 +23,26 @@ import streamlit as st
 
 from inventory import (
     add_delivery,
+    apply_planned_consumption,
     build_inventory_projection,
+    clear_consumption_plan,
+    clear_delivery_plan,
     days_until_stockout,
     delete_delivery,
+    get_delivery_weekdays,
+    init_consumption_plan_csv,
     init_deliveries_csv,
+    init_delivery_plan_csv,
     init_inventory_csv,
     load_deliveries_df,
     load_inventory_df,
+    load_manual_planned_use,
+    save_consumption_plan,
+    save_delivery_plan,
+    save_delivery_weekdays,
     save_product_inventory,
+    sync_inventory_products,
+    weekday_labels_text,
 )
 from square_csv import (
     DayImport,
@@ -115,6 +127,33 @@ def inject_css() -> None:
             padding: 1rem 1.2rem; margin-bottom: 1rem; color: #5a4a1a;
         }
         .empty-state-box strong { color: #1a1a2e; }
+        /* 在庫カレンダー: 計画消費・納品数（入力列）を強調 */
+        [data-testid="stDataEditor"] [aria-colindex="5"],
+        [data-testid="stDataEditor"] [aria-colindex="6"] {
+            background-color: #fff9f2 !important;
+        }
+        [data-testid="stDataEditor"] [aria-colindex="5"][role="columnheader"] {
+            background-color: #ffe8ec !important;
+            font-weight: 700 !important;
+            color: #c0392b !important;
+        }
+        [data-testid="stDataEditor"] [aria-colindex="6"][role="columnheader"] {
+            background-color: #e8f4ff !important;
+            font-weight: 700 !important;
+            color: #1a5276 !important;
+        }
+        [data-testid="stDataEditor"] [aria-colindex="5"] input {
+            border: 2px solid #e94560 !important;
+            border-radius: 6px !important;
+            background-color: #fff !important;
+            font-weight: 600 !important;
+        }
+        [data-testid="stDataEditor"] [aria-colindex="6"] input {
+            border: 2px solid #2980b9 !important;
+            border-radius: 6px !important;
+            background-color: #fff !important;
+            font-weight: 600 !important;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -207,6 +246,7 @@ def reset_application_data() -> None:
     init_empty_daily_csv()
     init_inventory_csv(load_products())
     init_deliveries_csv()
+    init_consumption_plan_csv()
     if not MAPPINGS_CSV.exists():
         init_empty_mappings_csv()
     VERSION_FILE.write_text(str(DATA_VERSION), encoding="utf-8")
@@ -239,6 +279,7 @@ def ensure_data_files() -> None:
         init_empty_mappings_csv()
     init_inventory_csv(load_products())
     init_deliveries_csv()
+    init_consumption_plan_csv()
     sync_square_mappings()
 
 
@@ -344,6 +385,7 @@ def add_product(name: str, unit_price: int) -> None:
             ignore_index=True,
         )
     products_df.to_csv(PRODUCTS_CSV, index=False, encoding="utf-8-sig")
+    sync_inventory_products(products_df)
 
 
 def update_product_price(product_id: str, unit_price: int) -> None:
@@ -1160,7 +1202,7 @@ def render_history_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> Non
 def render_products_mappings_tab(products_df: pd.DataFrame) -> None:
     st.markdown('<p class="section-title">フード商品の登録</p>', unsafe_allow_html=True)
     st.caption(
-        "新メニューを追加すると、CSV取り込み・ダッシュボードの対象に含められます。"
+        "新メニューを追加すると、CSV取り込み・ダッシュボード・**在庫管理**の対象に含められます。"
         " **単価は税抜** で登録してください（Squareの純売上・商品単価と揃えます）。"
     )
 
@@ -1594,22 +1636,26 @@ def plot_inventory_vertical_calendar(projection: pd.DataFrame, product_name: str
     colors = projection["status"].map({"out": "#e94560", "low": "#f0ad4e", "ok": "#0f3460"}).tolist()
 
     fig = go.Figure()
+    use_col = "planned_use" if "planned_use" in projection.columns else "predicted_use"
+    use_vals = projection[use_col].astype(int)
+    stock_vals = projection["stock_end"].astype(int)
     fig.add_trace(
         go.Bar(
             y=labels,
-            x=projection["predicted_use"],
+            x=use_vals,
             orientation="h",
-            name="予測消費",
+            name="計画消費",
             marker_color=colors,
-            text=[f"{int(v)} 個" for v in projection["predicted_use"]],
+            text=[f"{int(v)} 個" for v in use_vals],
             textposition="outside",
+            cliponaxis=False,
             hovertemplate="%{y}<br>消費: %{x} 個<extra></extra>",
         )
     )
     fig.add_trace(
         go.Scatter(
             y=labels,
-            x=projection["stock_end"],
+            x=stock_vals,
             mode="lines+markers",
             name="日末予想在庫",
             line=dict(color="#16a085", width=2.5),
@@ -1617,44 +1663,136 @@ def plot_inventory_vertical_calendar(projection: pd.DataFrame, product_name: str
             hovertemplate="%{y}<br>予想在庫: %{x} 個<extra></extra>",
         )
     )
+    x_max = max(int(use_vals.max()), int(stock_vals.max()), 1)
+    x_min = min(int(stock_vals.min()), 0)
     fig.update_layout(
-        title=f"{product_name} — 在庫消費カレンダー（上ほど近い日）",
+        title=dict(
+            text=f"{product_name} — 在庫消費カレンダー<br><sup>上ほど近い日</sup>",
+            x=0,
+            xanchor="left",
+            y=0.98,
+            yanchor="top",
+        ),
         xaxis_title="個数",
+        xaxis=dict(range=[x_min - max(20, abs(x_min) * 0.05), x_max * 1.25]),
         yaxis=dict(autorange="reversed", title=""),
         template="plotly_white",
-        height=max(420, len(projection) * 38),
+        height=max(440, len(projection) * 40),
         barmode="overlay",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
-        margin=dict(l=10, r=10, t=50, b=40),
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.12,
+            x=0.5,
+            xanchor="center",
+            bgcolor="rgba(255,255,255,0.95)",
+        ),
+        margin=dict(l=12, r=72, t=72, b=88),
+        uniformtext_minsize=10,
+        uniformtext_mode="hide",
     )
     return fig
 
 
-def build_inventory_calendar_table(projection: pd.DataFrame) -> pd.DataFrame:
-    """縦型カレンダー用の表（静的表示・iPad/Cloud向け）。"""
+def _projection_row_date(row: pd.Series) -> date:
+    day_val = row["date"]
+    if isinstance(day_val, pd.Timestamp):
+        return day_val.date()
+    if isinstance(day_val, date):
+        return day_val
+    return pd.to_datetime(day_val).date()
+
+
+PLAN_CONSUMPTION_COL = "✏️ 計画消費（入力）"
+DELIVERY_PLAN_COL = "📦 納品数（入力）"
+
+
+def format_delivery_display(row: pd.Series) -> str:
+    total = int(row.get("delivery", 0))
+    if total <= 0:
+        return "—"
+    scheduled = int(row.get("delivery_scheduled", 0))
+    extra = int(row.get("delivery_extra", 0))
+    if scheduled > 0 and extra > 0:
+        return f"+{total}（表{scheduled}+臨{extra}）"
+    if scheduled > 0:
+        return f"+{total}（表入力）"
+    if extra > 0:
+        return f"+{total}（臨時）"
+    return f"+{total}"
+
+
+def build_inventory_calendar_editor_df(
+    projection: pd.DataFrame,
+    delivery_weekdays: list[int] | None = None,
+) -> pd.DataFrame:
+    """縦型カレンダー（計画消費・納品数列を編集）。"""
     if projection.empty:
         return pd.DataFrame(
-            columns=["", "日付", "曜日", "予測消費", "入荷", "開始在庫", "日末在庫", "状態"]
+            columns=[
+                "",
+                "日付",
+                "曜日",
+                "予測消費",
+                PLAN_CONSUMPTION_COL,
+                DELIVERY_PLAN_COL,
+                "入荷",
+                "日末在庫",
+                "状態",
+            ]
         )
     cal = projection.copy()
-    status_label = {"ok": "🟢 通常", "low": "🟡 注意", "out": "🔴 不足"}
-    cal[""] = cal["is_today"].map(lambda x: "今日" if x else "")
-    cal["日付"] = cal["date"].apply(lambda d: d.strftime("%Y-%m-%d"))
-    cal["状態"] = cal["status"].map(lambda s: status_label.get(str(s), "🟢 通常"))
-    out = cal[["", "日付", "曜日", "predicted_use", "delivery", "stock_start", "stock_end", "状態"]].copy()
-    out.columns = ["", "日付", "曜日", "予測消費", "入荷", "開始在庫", "日末在庫", "状態"]
-    return out
+    status_label = {"ok": "🟢", "low": "🟡", "out": "🔴"}
+    wd_set = set(delivery_weekdays or [])
+
+    def row_marker(r: pd.Series) -> str:
+        if bool(r.get("is_today")):
+            return "今日"
+        day_val = _projection_row_date(r)
+        if day_val.weekday() in wd_set:
+            return "納品日"
+        return ""
+
+    cal[""] = cal.apply(row_marker, axis=1)
+    cal["日付"] = cal["date"].apply(
+        lambda d: _projection_row_date(pd.Series({"date": d})).strftime("%Y-%m-%d")
+    )
+    cal["状態"] = cal.apply(
+        lambda r: status_label.get(str(r["status"]), "🟢")
+        + (" ✎" if bool(r.get("is_manual")) else ""),
+        axis=1,
+    )
+    use_col = "planned_use" if "planned_use" in cal.columns else "predicted_use"
+    scheduled = cal["delivery_scheduled"] if "delivery_scheduled" in cal.columns else cal["delivery"]
+    return pd.DataFrame(
+        {
+            "": cal[""],
+            "日付": cal["日付"],
+            "曜日": cal["曜日"],
+            "予測消費": cal["predicted_use"].astype(int),
+            PLAN_CONSUMPTION_COL: cal[use_col].astype(int),
+            DELIVERY_PLAN_COL: scheduled.astype(int),
+            "入荷": cal.apply(format_delivery_display, axis=1),
+            "日末在庫": cal["stock_end"].astype(int),
+            "状態": cal["状態"],
+        }
+    )
 
 
 def render_inventory_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> None:
     st.markdown('<p class="section-title">在庫管理</p>', unsafe_allow_html=True)
     st.caption(
-        "過去の同曜日販売数から **予測消費** を算出し、縦型カレンダーで在庫の減り方を確認できます。"
-        " 入荷予定を登録するとその日の在庫に加算されます。"
+        "対象は **販売中のフード商品** です（サイドバー「商品・紐づけ設定」で追加した新商品も自動で表示されます）。"
+        " **納品曜日** で曜日を登録し、**納品数** は下のカレンダー表に直接入力します。"
+        " **計画消費** も同じ表で編集でき、保存後に日末在庫が再計算されます。"
     )
 
+    products_df = load_products()
     init_inventory_csv(products_df)
+    sync_inventory_products(products_df)
     init_deliveries_csv()
+    init_consumption_plan_csv()
+    init_delivery_plan_csv()
     product_list = active_products(products_df)
 
     selected_name = st.selectbox("対象フード商品", product_list["name"].tolist(), key="inv_product")
@@ -1684,6 +1822,37 @@ def render_inventory_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
             st.success("在庫を保存しました。")
             st.rerun()
 
+    st.markdown("##### 納品曜日")
+    st.caption("納品がある曜日にチェックを入れます。**納品数はカレンダー表に直接入力**してください。")
+
+    weekdays_current = get_delivery_weekdays(product_id)
+    wd_cols = st.columns(7)
+    new_weekdays: list[int] = []
+    for wd_idx, wd_label in enumerate(WEEKDAY_LABELS_JA):
+        with wd_cols[wd_idx]:
+            enabled = st.checkbox(
+                wd_label,
+                value=(wd_idx in weekdays_current),
+                key=f"inv_wd_on_{product_id}_{wd_idx}",
+            )
+            if enabled:
+                new_weekdays.append(wd_idx)
+
+    if st.button(
+        "納品曜日を保存",
+        type="secondary",
+        use_container_width=True,
+        key="inv_save_weekdays",
+    ):
+        save_delivery_weekdays(product_id, new_weekdays)
+        st.success(f"納品曜日を保存しました: {weekday_labels_text(new_weekdays)}")
+        st.rerun()
+
+    if weekdays_current:
+        st.caption(f"登録中: **{weekday_labels_text(weekdays_current)}**（カレンダー左列に「納品日」と表示）")
+    else:
+        st.caption("納品曜日が未設定です。")
+
     horizon = st.selectbox(
         "表示する日数（先の予測）",
         [7, 14, 21, 30],
@@ -1692,7 +1861,7 @@ def render_inventory_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
         key="inv_horizon",
     )
 
-    with st.expander("入荷予定の登録", expanded=False):
+    with st.expander("臨時の入荷（日付を指定）", expanded=False):
         dcol1, dcol2, dcol3 = st.columns([1, 1, 2])
         with dcol1:
             delivery_date = st.date_input("入荷日", value=date.today(), key="inv_delivery_date")
@@ -1727,6 +1896,7 @@ def render_inventory_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
         return
 
     start_date = date.today()
+    end_date = start_date + timedelta(days=int(horizon) - 1)
     projection = build_inventory_projection(
         daily_df,
         product_id,
@@ -1736,14 +1906,17 @@ def render_inventory_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
         load_deliveries_df(product_id),
         safety_stock=int(safety_stock),
     )
+    manual_use = load_manual_planned_use(product_id, start_date, end_date)
+    projection = apply_planned_consumption(projection, manual_use, int(safety_stock))
+    pred_by_day = {_projection_row_date(row): int(row["predicted_use"]) for _, row in projection.iterrows()}
 
-    avg_use = float(projection["predicted_use"].mean()) if not projection.empty else 0.0
+    avg_use = float(projection["planned_use"].mean()) if not projection.empty else 0.0
     stockout_in = days_until_stockout(projection)
     min_stock = int(projection["stock_end"].min()) if not projection.empty else 0
 
     m1, m2, m3, m4 = st.columns(4)
     with m1:
-        st.metric("予測の平均消費", f"{avg_use:,.1f} 個/日")
+        st.metric("計画の平均消費", f"{avg_use:,.1f} 個/日")
     with m2:
         st.metric(f"{horizon}日後の予想在庫", f"{int(projection['stock_end'].iloc[-1]):,} 個")
     with m3:
@@ -1754,12 +1927,90 @@ def render_inventory_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
         else:
             st.metric("在庫切れ予測", "なし", delta="期間内は維持")
 
-    cal_df = build_inventory_calendar_table(projection)
+    delivery_weekdays = get_delivery_weekdays(product_id)
+    editor_df = build_inventory_calendar_editor_df(projection, delivery_weekdays)
+    pred_by_delivery = {
+        _projection_row_date(row): int(row.get("delivery_scheduled", row.get("delivery", 0)))
+        for _, row in projection.iterrows()
+    }
 
     st.markdown("##### 縦型カレンダー")
-    # st.table は静的HTMLのため iPad / Streamlit Cloud で接続エラーになりにくい
-    st.table(cal_df)
-    st.caption("🔴 不足 · 🟡 注意 · 上から近い日付順")
+    st.caption(
+        f"**{PLAN_CONSUMPTION_COL}** と **{DELIVERY_PLAN_COL}** を編集できます。"
+        " 入荷列の **（臨時）** は上の「臨時の入荷」で追加した分です。"
+    )
+
+    save_plan = False
+    reset_plan = False
+    reset_delivery = False
+
+    with st.form("inv_calendar_plan_form", clear_on_submit=False):
+        edited_df = st.data_editor(
+            editor_df,
+            column_config={
+                PLAN_CONSUMPTION_COL: st.column_config.NumberColumn(
+                    PLAN_CONSUMPTION_COL,
+                    help="その日に使う個数",
+                    min_value=0,
+                    max_value=9999,
+                    step=1,
+                    format="%d",
+                ),
+                DELIVERY_PLAN_COL: st.column_config.NumberColumn(
+                    DELIVERY_PLAN_COL,
+                    help="その日の納品数（隔週など日ごとに変えられます）",
+                    min_value=0,
+                    max_value=9999,
+                    step=1,
+                    format="%d",
+                ),
+            },
+            disabled=["", "日付", "曜日", "予測消費", "入荷", "日末在庫", "状態"],
+            hide_index=True,
+            use_container_width=True,
+            num_rows="fixed",
+        )
+        btn_save, btn_reset, btn_reset_del = st.columns(3)
+        with btn_save:
+            save_plan = st.form_submit_button("カレンダーを保存して在庫を再計算", type="primary")
+        with btn_reset:
+            reset_plan = st.form_submit_button("計画消費を予測に戻す")
+        with btn_reset_del:
+            reset_delivery = st.form_submit_button("納品数をクリア")
+
+    if save_plan:
+        use_deltas: dict[date, int] = {}
+        delivery_deltas: dict[date, int] = {}
+        for _, row in edited_df.iterrows():
+            day_val = pd.to_datetime(str(row["日付"])).date()
+            planned = int(row[PLAN_CONSUMPTION_COL])
+            predicted = pred_by_day.get(day_val, planned)
+            if planned != predicted:
+                use_deltas[day_val] = planned
+            delivery_qty = int(row[DELIVERY_PLAN_COL])
+            base_delivery = pred_by_delivery.get(day_val, 0)
+            if delivery_qty != base_delivery:
+                delivery_deltas[day_val] = delivery_qty
+        clear_consumption_plan(product_id, start_date, end_date)
+        if use_deltas:
+            save_consumption_plan(product_id, use_deltas)
+        clear_delivery_plan(product_id, start_date, end_date)
+        if delivery_deltas:
+            save_delivery_plan(product_id, delivery_deltas)
+        st.success("カレンダーを保存し、在庫見込みを更新しました。")
+        st.rerun()
+
+    if reset_plan:
+        clear_consumption_plan(product_id, start_date, end_date)
+        st.success("計画消費を予測に戻しました。")
+        st.rerun()
+
+    if reset_delivery:
+        clear_delivery_plan(product_id, start_date, end_date)
+        st.success("表示期間の納品数をクリアしました。")
+        st.rerun()
+
+    st.caption("🔴 不足 · 🟡 注意 · ✎ 手入力 · 納品日＝曜日登録 · 保存後に日末在庫が更新されます")
 
     st.markdown("##### 消費と予想在庫")
     st.plotly_chart(
