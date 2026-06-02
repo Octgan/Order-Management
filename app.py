@@ -21,7 +21,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from inventory import (
+from stock_inventory import (
     add_delivery,
     apply_planned_consumption,
     build_inventory_projection,

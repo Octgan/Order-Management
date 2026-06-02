@@ -9,7 +9,7 @@ from typing import Any
 
 import pandas as pd
 
-DATA_DIR = Path(__file__).resolve().parent / "data"
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 INVENTORY_CSV = DATA_DIR / "inventory.csv"
 DELIVERIES_CSV = DATA_DIR / "inventory_deliveries.csv"
 CONSUMPTION_PLAN_CSV = DATA_DIR / "inventory_consumption_plan.csv"
