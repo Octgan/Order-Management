@@ -44,6 +44,7 @@ from stock_inventory import (
     sync_inventory_products,
     weekday_labels_text,
 )
+from mtg_report import MtgReportContext, build_mtg_report_pdf, plotly_fig_to_png
 from square_csv import (
     DayImport,
     build_square_product_label,
@@ -826,16 +827,16 @@ def resolve_dashboard_period(
     return data_min, data_max
 
 
-def calc_food_selection_rate(
+def calc_food_selection_period_totals(
     daily_df: pd.DataFrame,
     product_id: str,
     day_totals: pd.DataFrame,
     start_date: date,
     end_date: date,
-) -> float:
-    """指定期間のフード選択率 = 対象商品の販売数合計 ÷ 店舗客数合計。"""
+) -> tuple[int, int]:
+    """指定期間の対象商品販売数合計と店舗客数合計。"""
     if daily_df.empty or day_totals.empty or start_date > end_date:
-        return 0.0
+        return 0, 0
     start = to_ts(start_date)
     end = to_ts(end_date)
     sub = daily_df[
@@ -844,10 +845,116 @@ def calc_food_selection_rate(
         & (daily_df["date"] <= end)
     ]
     totals = day_totals[(day_totals["date"] >= start) & (day_totals["date"] <= end)]
-    customer_sum = int(totals["total_customers"].sum())
-    if sub.empty or customer_sum == 0:
+    units = int(sub["units_sold"].sum()) if not sub.empty else 0
+    customers = int(totals["total_customers"].sum())
+    return units, customers
+
+
+def calc_food_selection_rate(
+    daily_df: pd.DataFrame,
+    product_id: str,
+    day_totals: pd.DataFrame,
+    start_date: date,
+    end_date: date,
+) -> float:
+    """指定期間のフード選択率 = 対象商品の販売数合計 ÷ 店舗客数合計。"""
+    units, customers = calc_food_selection_period_totals(
+        daily_df, product_id, day_totals, start_date, end_date
+    )
+    if customers == 0:
         return 0.0
-    return float(sub["units_sold"].sum() / customer_sum)
+    return float(units / customers)
+
+
+def plot_food_selection_rate_pie(
+    selection_rate: float,
+    product_name: str,
+    period_label: str,
+    units_sold: int,
+    total_customers: int,
+) -> go.Figure:
+    """フード選択率のドーナツ型丸グラフ。"""
+    fig = go.Figure()
+    center_text = "—"
+    if total_customers <= 0:
+        fig.add_trace(
+            go.Pie(
+                labels=["データなし"],
+                values=[1],
+                hole=0.5,
+                marker=dict(colors=["#e0e0e0"]),
+                textinfo="label",
+                hoverinfo="skip",
+            )
+        )
+    elif selection_rate <= 0:
+        fig.add_trace(
+            go.Pie(
+                labels=["フード選択", "その他（客数ベース）"],
+                values=[0.001, 99.999],
+                hole=0.5,
+                marker=dict(colors=["#e94560", "#ecf0f1"]),
+                textinfo="percent",
+                textposition="inside",
+                hovertemplate="%{label}<br>%{percent}<extra></extra>",
+            )
+        )
+        center_text = "0.0%"
+    elif selection_rate >= 1.0:
+        fig.add_trace(
+            go.Pie(
+                labels=[f"フード選択（{product_name}）"],
+                values=[100],
+                hole=0.5,
+                marker=dict(colors=["#e94560"]),
+                textinfo="label",
+                hovertemplate=(
+                    f"フード選択<br>販売数: {units_sold:,} 個<br>"
+                    f"店舗客数: {total_customers:,} 人<br>"
+                    f"選択率: {selection_rate:.1%}<extra></extra>"
+                ),
+            )
+        )
+        center_text = f"{selection_rate:.1%}\n(1人あたり1個超)"
+    else:
+        rate_pct = selection_rate * 100
+        other_pct = 100 - rate_pct
+        fig.add_trace(
+            go.Pie(
+                labels=[f"フード選択（{product_name}）", "その他（客数ベース）"],
+                values=[rate_pct, other_pct],
+                hole=0.5,
+                marker=dict(colors=["#e94560", "#ecf0f1"]),
+                textinfo="percent",
+                textposition="inside",
+                hovertemplate=(
+                    "%{label}<br>%{percent}<br>"
+                    f"販売数: {units_sold:,} 個 / 店舗客数: {total_customers:,} 人<extra></extra>"
+                ),
+            )
+        )
+        center_text = f"{selection_rate:.1%}"
+
+    fig.update_layout(
+        title=f"フード選択率（{period_label}）",
+        template="plotly_white",
+        height=340,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="top", y=-0.08, x=0.5, xanchor="center"),
+        margin=dict(t=48, b=64, l=16, r=16),
+        annotations=[
+            dict(
+                text=center_text,
+                x=0.5,
+                y=0.5,
+                xref="paper",
+                yref="paper",
+                showarrow=False,
+                font=dict(size=20, color="#1a1a2e"),
+            )
+        ],
+    )
+    return fig
 
 
 def plot_weekday_comparison(last_week: int, four_week_avg: float, product_name: str) -> go.Figure:
@@ -1451,17 +1558,34 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
         )
     period_label = f"{period_start:%Y/%m/%d} 〜 {period_end:%Y/%m/%d}"
 
-    selection_rate = calc_food_selection_rate(
+    period_units, period_customers = calc_food_selection_period_totals(
         daily_df, product_id, day_totals, period_start, period_end
     )
-    sr1, sr2 = st.columns([1, 3])
+    selection_rate = (
+        float(period_units / period_customers) if period_customers > 0 else 0.0
+    )
+    sr1, sr2 = st.columns([1, 2])
     with sr1:
         st.metric(f"フード選択率（{period_label}）", f"{selection_rate:.2%}")
-    with sr2:
         st.caption(
-            f"**{selected_name}** の販売数 ÷ 店舗客数（指定期間の合計）。"
-            " 発注予測タブの計算にもこの期間の選択率を使います。"
+            f"販売 **{period_units:,}** 個 ÷ 客数 **{period_customers:,}** 人"
         )
+    with sr2:
+        st.plotly_chart(
+            plot_food_selection_rate_pie(
+                selection_rate,
+                selected_name,
+                period_label,
+                period_units,
+                period_customers,
+            ),
+            use_container_width=True,
+            config={"displayModeBar": False, "responsive": True},
+        )
+    st.caption(
+        f"**{selected_name}** の販売数 ÷ 店舗客数（指定期間の合計）。"
+        " 丸グラフは客数に対する選択の割合イメージです。発注予測タブの計算にもこの期間の選択率を使います。"
+    )
 
     period_stats = calc_avg_units_sold_in_period(daily_df, product_id, period_start, period_end)
     weekday_units = calc_avg_units_by_weekday_in_period(daily_df, product_id, period_start, period_end)
@@ -1623,6 +1747,258 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
             st.warning("収容量の85%を超えています。")
         else:
             st.success("収容容量内の推奨発注量です。")
+
+
+def render_mtg_report_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> None:
+    """MTG 用 PDF レポートの作成・ダウンロード。"""
+    st.markdown('<p class="section-title">MTGレポート（PDF）</p>', unsafe_allow_html=True)
+    st.caption(
+        "売上・フード選択率・発注予測・在庫見込みを1つの PDF にまとめます。"
+        " 会議の資料としてダウンロードしてご利用ください。"
+    )
+    if daily_df.empty:
+        st.warning(EMPTY_DATA_MESSAGE)
+        return
+
+    daily_df = daily_df.sort_values("date")
+    day_totals = get_day_totals(daily_df)
+    product_list = active_products(products_df)
+    selected_name = st.selectbox("対象フード商品", product_list["name"].tolist(), key="mtg_product")
+    selected = product_list[product_list["name"] == selected_name].iloc[0]
+    product_id = str(selected["product_id"])
+
+    product_df = daily_df[daily_df["product_id"] == product_id]
+    latest_date = get_latest_product_sales_date(daily_df, product_id) or get_latest_business_date(
+        daily_df, day_totals
+    )
+    if latest_date is None:
+        st.warning(EMPTY_DATA_MESSAGE)
+        return
+
+    recorded = list_recorded_dates(daily_df)
+    data_min = recorded[-1] if recorded else latest_date
+    data_max = latest_date
+
+    pcol1, pcol2 = st.columns(2)
+    with pcol1:
+        period_preset = st.selectbox(
+            "集計期間",
+            ["直近7日", "直近30日", "直近90日", "全期間", "日付を指定"],
+            key="mtg_period_preset",
+        )
+    with pcol2:
+        include_inventory = st.checkbox("在庫見込みを含める", value=True, key="mtg_include_inv")
+
+    if period_preset == "日付を指定":
+        dcol1, dcol2 = st.columns(2)
+        with dcol1:
+            period_start = st.date_input(
+                "開始日",
+                value=max(data_min, latest_date - timedelta(days=29)),
+                min_value=data_min,
+                max_value=data_max,
+                key="mtg_period_start",
+            )
+        with dcol2:
+            period_end = st.date_input(
+                "終了日",
+                value=latest_date,
+                min_value=data_min,
+                max_value=data_max,
+                key="mtg_period_end",
+            )
+    else:
+        period_start, period_end = resolve_dashboard_period(
+            period_preset,
+            data_min=data_min,
+            data_max=data_max,
+            latest_date=latest_date,
+        )
+    period_label = f"{period_start:%Y/%m/%d} 〜 {period_end:%Y/%m/%d}"
+
+    st.markdown("##### 発注予測の前提（PDFに記載）")
+    fc1, fc2, fc3 = st.columns(3)
+    with fc1:
+        predicted_customers = st.number_input(
+            "予測客数", min_value=100, max_value=6000, value=2400, step=50, key="mtg_pred_customers"
+        )
+    with fc2:
+        correction_pct = st.slider(
+            "天気・イベント補正（%）", -30, 50, 0, key="mtg_correction_pct"
+        )
+    with fc3:
+        current_stock = st.number_input(
+            "現在の在庫数（個）", min_value=0, max_value=5000, value=120, step=5, key="mtg_stock"
+        )
+
+    inv_horizon = 14
+    if include_inventory:
+        inv_horizon = st.selectbox(
+            "在庫見込みの日数",
+            [7, 14, 21, 30],
+            index=1,
+            format_func=lambda d: f"{d}日間",
+            key="mtg_inv_horizon",
+        )
+
+    report_memo = st.text_area(
+        "MTGメモ（任意・PDFに記載）",
+        placeholder="例: 来週は雨予報のため補正 -10% で検討",
+        key="mtg_memo",
+    )
+
+    include_charts = st.checkbox("グラフをPDFに含める", value=True, key="mtg_include_charts")
+
+    if st.button("PDFを作成", type="primary", key="mtg_build_pdf"):
+        latest_row = product_df[product_df["date"] == to_ts(latest_date)]
+        latest_units = int(latest_row["units_sold"].iloc[0]) if not latest_row.empty else 0
+        day_rows = daily_df[daily_df["date"] == to_ts(latest_date)]
+        day_total_sales = int(day_rows["total_sales"].iloc[0]) if not day_rows.empty else 0
+        single_item_sales = calc_single_item_sales_indicator(day_total_sales, latest_units)
+        lw_sales = last_week_same_day_sales(daily_df, product_id, latest_date)
+        avg_4w = four_week_same_weekday_avg(daily_df, product_id, latest_date)
+
+        period_units, period_customers = calc_food_selection_period_totals(
+            daily_df, product_id, day_totals, period_start, period_end
+        )
+        selection_rate = float(period_units / period_customers) if period_customers > 0 else 0.0
+        period_stats = calc_avg_units_sold_in_period(daily_df, product_id, period_start, period_end)
+        customer_stats = calc_avg_customers_in_period(day_totals, period_start, period_end)
+        single_item_stats = calc_single_item_sales_stats_in_period(
+            daily_df, product_id, period_start, period_end
+        )
+        weekday_units = calc_avg_units_by_weekday_in_period(
+            daily_df, product_id, period_start, period_end
+        )
+        trend_df = build_product_trend_frame(
+            daily_df, product_id, start_date=period_start, end_date=period_end
+        )
+        customer_trend = build_customer_trend_frame(day_totals, period_start, period_end)
+
+        correction_factor = 1.0 + correction_pct / 100.0
+        recommended = max(
+            0,
+            int(round(predicted_customers * selection_rate * correction_factor - current_stock)),
+        )
+
+        chart_images: dict[str, bytes] = {}
+        if include_charts:
+            chart_images["selection_pie"] = plotly_fig_to_png(
+                plot_food_selection_rate_pie(
+                    selection_rate,
+                    selected_name,
+                    period_label,
+                    period_units,
+                    period_customers,
+                ),
+                height=380,
+            )
+            if not weekday_units.empty:
+                chart_images["weekday_bar"] = plotly_fig_to_png(
+                    plot_weekday_avg_units(weekday_units, selected_name, period_label),
+                    height=360,
+                )
+            if not trend_df.empty:
+                chart_images["sales_trend"] = plotly_fig_to_png(
+                    plot_daily_trend(trend_df, selected_name, period_label),
+                    height=360,
+                )
+            if not customer_trend.empty:
+                chart_images["customer_trend"] = plotly_fig_to_png(
+                    plot_customer_trend(customer_trend, customer_stats["avg"], period_label),
+                    height=360,
+                )
+            chart_images = {k: v for k, v in chart_images.items() if v}
+
+        inventory_summary: dict[str, Any] | None = None
+        if include_inventory:
+            inv_df = load_inventory_df()
+            inv_row = inv_df[inv_df["product_id"].astype(str) == product_id]
+            inv_stock = int(inv_row["current_stock"].iloc[0]) if not inv_row.empty else int(current_stock)
+            inv_safety = int(inv_row["safety_stock"].iloc[0]) if not inv_row.empty else 10
+            start_date = date.today()
+            projection = build_inventory_projection(
+                daily_df,
+                product_id,
+                inv_stock,
+                start_date,
+                int(inv_horizon),
+                load_deliveries_df(product_id),
+                safety_stock=inv_safety,
+            )
+            end_date = start_date + timedelta(days=int(inv_horizon) - 1)
+            manual_use = load_manual_planned_use(product_id, start_date, end_date)
+            projection = apply_planned_consumption(projection, manual_use, inv_safety)
+            stockout_in = days_until_stockout(projection)
+            if stockout_in is not None:
+                stockout_label = f"{stockout_in} 日後"
+            else:
+                stockout_label = "なし（期間内は維持）"
+            inventory_summary = {
+                "current_stock": inv_stock,
+                "safety_stock": inv_safety,
+                "horizon": inv_horizon,
+                "avg_use": float(projection["planned_use"].mean()) if not projection.empty else 0.0,
+                "min_stock": int(projection["stock_end"].min()) if not projection.empty else 0,
+                "end_stock": int(projection["stock_end"].iloc[-1]) if not projection.empty else 0,
+                "stockout_label": stockout_label,
+            }
+            if include_charts and not projection.empty:
+                chart_images["inventory"] = plotly_fig_to_png(
+                    plot_inventory_vertical_calendar(projection, selected_name),
+                    width=700,
+                    height=max(420, 28 * len(projection)),
+                )
+
+        ctx = MtgReportContext(
+            app_title=APP_TITLE,
+            product_name=selected_name,
+            period_label=period_label,
+            period_start=period_start,
+            period_end=period_end,
+            latest_label=latest_date.strftime("%Y/%m/%d"),
+            latest_units=latest_units,
+            latest_store_sales=day_total_sales,
+            latest_single_item_sales=single_item_sales,
+            lw_sales=lw_sales,
+            avg_4w=avg_4w,
+            selection_rate=selection_rate,
+            period_units=period_units,
+            period_customers=period_customers,
+            period_stats=period_stats,
+            customer_stats=customer_stats,
+            single_item_stats=single_item_stats,
+            weekday_units=weekday_units,
+            predicted_customers=int(predicted_customers),
+            correction_pct=int(correction_pct),
+            current_stock=int(current_stock),
+            recommended_order=recommended,
+            correction_factor=correction_factor,
+            cold_storage_capacity=COLD_STORAGE_CAPACITY,
+            inventory_summary=inventory_summary,
+            chart_images=chart_images,
+            memo=report_memo,
+        )
+        try:
+            pdf_bytes = build_mtg_report_pdf(ctx)
+            st.session_state["mtg_pdf_bytes"] = pdf_bytes
+            st.session_state["mtg_pdf_filename"] = (
+                f"MTG_{selected_name}_{period_end:%Y%m%d}.pdf"
+            )
+            st.success("PDFを作成しました。下のボタンからダウンロードできます。")
+        except Exception as exc:
+            st.error(f"PDFの作成に失敗しました: {exc}")
+
+    if st.session_state.get("mtg_pdf_bytes"):
+        st.download_button(
+            label="📄 PDFをダウンロード",
+            data=st.session_state["mtg_pdf_bytes"],
+            file_name=st.session_state.get("mtg_pdf_filename", "MTG_report.pdf"),
+            mime="application/pdf",
+            type="primary",
+            use_container_width=True,
+            key="mtg_download_pdf",
+        )
 
 
 def plot_inventory_vertical_calendar(projection: pd.DataFrame, product_name: str) -> go.Figure:
@@ -2073,8 +2449,8 @@ def main() -> None:
     elif side_view == "商品・紐づけ設定":
         render_products_mappings_tab(products_df)
     else:
-        t_csv, t_dash, t_inv = st.tabs(
-            ["Square CSVアップロード", "ダッシュボード・可視化", "在庫管理"]
+        t_csv, t_dash, t_inv, t_mtg = st.tabs(
+            ["Square CSVアップロード", "ダッシュボード・可視化", "在庫管理", "MTGレポート"]
         )
         with t_csv:
             render_square_upload_tab(products_df, daily_df)
@@ -2082,6 +2458,8 @@ def main() -> None:
             render_dashboard_tab(products_df, daily_df)
         with t_inv:
             render_inventory_tab(products_df, daily_df)
+        with t_mtg:
+            render_mtg_report_tab(products_df, daily_df)
 
 
 if __name__ == "__main__":
