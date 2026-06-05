@@ -44,7 +44,6 @@ from stock_inventory import (
     sync_inventory_products,
     weekday_labels_text,
 )
-from mtg_report import FoodReportSection, MtgReportContext, build_mtg_report_pdf, plotly_fig_to_png
 from square_csv import (
     DayImport,
     build_square_product_label,
@@ -1845,8 +1844,29 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
             st.success("収容容量内の推奨発注量です。")
 
 
+def _load_mtg_report_modules() -> tuple[Any, ...]:
+    """MTG PDF 用モジュール（起動時ではなくタブ表示時に読み込む）。"""
+    from mtg_report import (
+        FoodReportSection,
+        MtgReportContext,
+        build_mtg_report_pdf,
+        plotly_fig_to_png,
+    )
+
+    return FoodReportSection, MtgReportContext, build_mtg_report_pdf, plotly_fig_to_png
+
+
 def render_mtg_report_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> None:
     """MTG 用 PDF レポートの作成・ダウンロード（全フード）。"""
+    try:
+        FoodReportSection, MtgReportContext, build_mtg_report_pdf, plotly_fig_to_png = (
+            _load_mtg_report_modules()
+        )
+    except ImportError as exc:
+        st.error(f"MTGレポート機能を読み込めません: {exc}")
+        st.caption("ダッシュボード・在庫管理は引き続き利用できます。")
+        return
+
     st.markdown('<p class="section-title">MTGレポート（PDF）</p>', unsafe_allow_html=True)
     st.caption(
         "**全フード** の売上・選択率・発注予測・在庫見込みを1つの PDF にまとめます。"
