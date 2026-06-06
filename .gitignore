@@ -2,3 +2,5 @@
 __pycache__/
 *.pyc
 .streamlit/secrets.toml
+data/inventory.csv
+data/inventory_*.csv
