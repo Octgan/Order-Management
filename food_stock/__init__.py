@@ -1,6 +1,6 @@
 """在庫管理（Streamlit Cloud 向けパッケージ）。"""
 
-from stock_inventory.logic import (
+from food_stock.logic import (
     DEFAULT_MAX_STOCK,
     add_delivery,
     apply_planned_consumption,

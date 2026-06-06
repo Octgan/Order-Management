@@ -345,6 +345,8 @@ def load_inventory_df() -> pd.DataFrame:
         if col not in df.columns:
             if col in ("delivery_weekdays", "delivery_by_weekday", "delivery_by_weekday_parity"):
                 df[col] = ""
+            elif col == "max_stock":
+                df[col] = str(DEFAULT_MAX_STOCK)
             else:
                 df[col] = "0" if col != "updated_at" else ""
     df = _coerce_inventory_text_columns(df)

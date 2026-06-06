@@ -21,30 +21,33 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from stock_inventory import (
-    DEFAULT_MAX_STOCK,
-    add_delivery,
-    apply_planned_consumption,
-    build_inventory_projection,
-    clear_consumption_plan,
-    clear_delivery_plan,
-    days_until_stockout,
-    delete_delivery,
-    get_delivery_weekdays,
-    init_consumption_plan_csv,
-    init_deliveries_csv,
-    init_delivery_plan_csv,
-    init_inventory_csv,
-    load_deliveries_df,
-    load_inventory_df,
-    load_manual_planned_use,
-    save_consumption_plan,
-    save_delivery_plan,
-    save_delivery_weekdays,
-    save_product_inventory,
-    sync_inventory_products,
-    weekday_labels_text,
-)
+try:
+    from food_stock import (
+        add_delivery,
+        apply_planned_consumption,
+        build_inventory_projection,
+        clear_consumption_plan,
+        clear_delivery_plan,
+        days_until_stockout,
+        delete_delivery,
+        get_delivery_weekdays,
+        init_consumption_plan_csv,
+        init_deliveries_csv,
+        init_delivery_plan_csv,
+        init_inventory_csv,
+        load_deliveries_df,
+        load_inventory_df,
+        load_manual_planned_use,
+        save_consumption_plan,
+        save_delivery_plan,
+        save_delivery_weekdays,
+        save_product_inventory,
+        sync_inventory_products,
+        weekday_labels_text,
+    )
+except ImportError as _food_stock_import_error:
+    st.error(f"在庫モジュールの読み込みに失敗しました: {_food_stock_import_error}")
+    st.stop()
 from square_csv import (
     DayImport,
     build_square_product_label,
@@ -2066,10 +2069,10 @@ def render_mtg_report_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> 
                 inv_max = (
                     int(inv_row["max_stock"].iloc[0])
                     if not inv_row.empty and "max_stock" in inv_row.columns
-                    else DEFAULT_MAX_STOCK
+                    else COLD_STORAGE_CAPACITY
                 )
                 if inv_max <= 0:
-                    inv_max = DEFAULT_MAX_STOCK
+                    inv_max = COLD_STORAGE_CAPACITY
                 start_date = date.today()
                 projection = build_inventory_projection(
                     daily_df,
@@ -2317,7 +2320,7 @@ def build_inventory_calendar_editor_df(
         )
     cal = projection.copy()
     status_label = {"ok": "🟢", "low": "🟡", "out": "🔴", "over": "🟣"}
-    max_val = int(max_stock) if int(max_stock) > 0 else DEFAULT_MAX_STOCK
+    max_val = int(max_stock) if int(max_stock) > 0 else COLD_STORAGE_CAPACITY
     wd_set = set(delivery_weekdays or [])
 
     def row_marker(r: pd.Series) -> str:
@@ -2362,9 +2365,9 @@ def get_inventory_row_defaults(inv_df: pd.DataFrame, product_id: str) -> tuple[i
     inv_row = inv_df[inv_df["product_id"].astype(str) == str(product_id)]
     stock = int(inv_row["current_stock"].iloc[0]) if not inv_row.empty else 0
     safety = int(inv_row["safety_stock"].iloc[0]) if not inv_row.empty else 10
-    max_stock = int(inv_row["max_stock"].iloc[0]) if not inv_row.empty else DEFAULT_MAX_STOCK
+    max_stock = int(inv_row["max_stock"].iloc[0]) if not inv_row.empty else COLD_STORAGE_CAPACITY
     if max_stock <= 0:
-        max_stock = DEFAULT_MAX_STOCK
+        max_stock = COLD_STORAGE_CAPACITY
     return stock, safety, max_stock
 
 
