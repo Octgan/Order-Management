@@ -294,6 +294,7 @@ def build_mtg_report_pdf_impl(ctx: MtgReportContext) -> bytes:
                 kv_table(
                     [
                         ("安全在庫", f"{inv.get('safety_stock', 0):,} 個"),
+                        ("収納MAX", f"{inv.get('max_stock', 0):,} 個"),
                         ("計画の平均消費", f"{inv.get('avg_use', 0):,.1f} 個/日"),
                         ("期間内の最低在庫", f"{inv.get('min_stock', 0):,} 個"),
                         ("在庫切れ予測", inv.get("stockout_label", "—")),

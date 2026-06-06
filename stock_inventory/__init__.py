@@ -1,6 +1,7 @@
 """在庫管理（Streamlit Cloud 向けパッケージ）。"""
 
 from stock_inventory.logic import (
+    DEFAULT_MAX_STOCK,
     add_delivery,
     apply_planned_consumption,
     build_inventory_projection,
@@ -25,6 +26,7 @@ from stock_inventory.logic import (
 )
 
 __all__ = [
+    "DEFAULT_MAX_STOCK",
     "add_delivery",
     "apply_planned_consumption",
     "build_inventory_projection",

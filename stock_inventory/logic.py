@@ -15,11 +15,14 @@ DELIVERIES_CSV = DATA_DIR / "inventory_deliveries.csv"
 CONSUMPTION_PLAN_CSV = DATA_DIR / "inventory_consumption_plan.csv"
 DELIVERY_PLAN_CSV = DATA_DIR / "inventory_delivery_plan.csv"
 
+DEFAULT_MAX_STOCK = 300
+
 INVENTORY_COLUMNS = [
     "product_id",
     "product_name",
     "current_stock",
     "safety_stock",
+    "max_stock",
     "delivery_weekdays",
     "delivery_quantity",
     "delivery_by_weekday",
@@ -49,6 +52,7 @@ def init_inventory_csv(products_df: pd.DataFrame) -> None:
             "product_name": str(row["name"]),
             "current_stock": 0,
             "safety_stock": 10,
+            "max_stock": DEFAULT_MAX_STOCK,
             "delivery_weekdays": "",
             "delivery_quantity": 0,
             "delivery_by_weekday": "",
@@ -269,6 +273,7 @@ def save_delivery_weekdays(product_id: str, weekdays: list[int]) -> None:
                             "product_name": "",
                             "current_stock": 0,
                             "safety_stock": 10,
+                            "max_stock": DEFAULT_MAX_STOCK,
                             **payload,
                         }
                     ]
@@ -301,6 +306,7 @@ def sync_inventory_products(products_df: pd.DataFrame) -> None:
                     "product_name": pname,
                     "current_stock": 0,
                     "safety_stock": 10,
+                    "max_stock": DEFAULT_MAX_STOCK,
                     "delivery_weekdays": "",
                     "delivery_quantity": 0,
                     "delivery_by_weekday": "",
@@ -344,6 +350,10 @@ def load_inventory_df() -> pd.DataFrame:
     df = _coerce_inventory_text_columns(df)
     df["current_stock"] = pd.to_numeric(df["current_stock"], errors="coerce").fillna(0).astype(int)
     df["safety_stock"] = pd.to_numeric(df["safety_stock"], errors="coerce").fillna(0).astype(int)
+    df["max_stock"] = pd.to_numeric(df.get("max_stock", DEFAULT_MAX_STOCK), errors="coerce").fillna(
+        DEFAULT_MAX_STOCK
+    ).astype(int)
+    df.loc[df["max_stock"] <= 0, "max_stock"] = DEFAULT_MAX_STOCK
     df["delivery_quantity"] = pd.to_numeric(df["delivery_quantity"], errors="coerce").fillna(0).astype(int)
     return df
 
@@ -448,6 +458,7 @@ def save_weekday_delivery_schedule(product_id: str, schedule: dict[int, int]) ->
                             "product_name": "",
                             "current_stock": 0,
                             "safety_stock": 10,
+                            "max_stock": DEFAULT_MAX_STOCK,
                             **payload,
                         }
                     ]
@@ -594,6 +605,7 @@ def save_weekday_delivery_schedule_parity(
                             "product_name": "",
                             "current_stock": 0,
                             "safety_stock": 10,
+                            "max_stock": DEFAULT_MAX_STOCK,
                             **payload,
                         }
                     ]
@@ -634,15 +646,20 @@ def save_product_inventory(
     product_name: str,
     current_stock: int,
     safety_stock: int,
+    max_stock: int | None = None,
 ) -> None:
-    """在庫数・安全在庫を保存。"""
+    """在庫数・安全在庫・収納MAXを保存。"""
     df = load_inventory_df()
     pid = str(product_id)
     now = datetime.now().isoformat()
     mask = df["product_id"].astype(str) == pid
+    max_val = int(max_stock) if max_stock is not None else DEFAULT_MAX_STOCK
+    if max_val <= 0:
+        max_val = DEFAULT_MAX_STOCK
     if mask.any():
         df.loc[mask, "current_stock"] = int(current_stock)
         df.loc[mask, "safety_stock"] = int(safety_stock)
+        df.loc[mask, "max_stock"] = max_val
         df.loc[mask, "product_name"] = product_name
         df.loc[mask, "updated_at"] = now
     else:
@@ -656,6 +673,7 @@ def save_product_inventory(
                             "product_name": product_name,
                             "current_stock": int(current_stock),
                             "safety_stock": int(safety_stock),
+                            "max_stock": max_val,
                             "delivery_weekdays": "",
                             "delivery_quantity": 0,
                             "delivery_by_weekday": "",
@@ -748,6 +766,7 @@ def build_inventory_projection(
     horizon_days: int,
     deliveries: pd.DataFrame | None = None,
     safety_stock: int = 0,
+    max_stock: int = 0,
 ) -> pd.DataFrame:
     """日別の予測消費・入荷・予想在庫を計算（縦型カレンダー用）。"""
     end_date = start_date + timedelta(days=horizon_days - 1)
@@ -786,13 +805,32 @@ def build_inventory_projection(
         stock = stock_after
 
     out = pd.DataFrame(rows)
-    return apply_planned_consumption(out, {}, safety_stock)
+    return apply_planned_consumption(out, {}, safety_stock, max_stock)
+
+
+def _apply_stock_status(
+    projection: pd.DataFrame,
+    safety_stock: int,
+    max_stock: int,
+) -> pd.DataFrame:
+    """日末在庫から状態ラベルを付与（不足・注意・収納超過）。"""
+    out = projection.copy()
+    out["status"] = "ok"
+    out.loc[out["stock_end"] < 0, "status"] = "out"
+    if int(max_stock) > 0:
+        out.loc[out["stock_end"] > int(max_stock), "status"] = "over"
+    out.loc[
+        (out["status"] == "ok") & (out["stock_end"] < int(safety_stock)),
+        "status",
+    ] = "low"
+    return out
 
 
 def apply_planned_consumption(
     projection: pd.DataFrame,
     manual_by_day: dict[date, int],
     safety_stock: int,
+    max_stock: int = 0,
 ) -> pd.DataFrame:
     """計画消費（手入力含む）で日末在庫・状態を再計算。"""
     if projection.empty:
@@ -818,10 +856,7 @@ def apply_planned_consumption(
         out.at[i, "stock_end"] = stock_after
         stock = stock_after
 
-    out["status"] = "ok"
-    out.loc[out["stock_end"] < 0, "status"] = "out"
-    out.loc[(out["stock_end"] >= 0) & (out["stock_end"] < int(safety_stock)), "status"] = "low"
-    return out
+    return _apply_stock_status(out, safety_stock, max_stock)
 
 
 def days_until_stockout(projection: pd.DataFrame) -> int | None:

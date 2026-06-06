@@ -22,6 +22,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from stock_inventory import (
+    DEFAULT_MAX_STOCK,
     add_delivery,
     apply_planned_consumption,
     build_inventory_projection,
@@ -1799,14 +1800,48 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
             )
 
     with tab_order:
+        init_inventory_csv(products_df)
+        sync_inventory_products(products_df)
+        order_inv_df = load_inventory_df()
+        order_default_stock, order_default_safety, order_default_max = get_inventory_row_defaults(
+            order_inv_df, str(product_id)
+        )
+
         st.caption(
             f"フード選択率（{period_label}）: **{product_selection_rate:.2%}** — 対象商品: {selected_name}"
             f"（全フード合計: {all_foods_rate:.2%}）"
         )
         fc1, fc2, fc3 = st.columns(3)
-        predicted_customers = fc1.number_input("予測客数", min_value=100, max_value=6000, value=2400, step=50)
+        predicted_customers = fc1.number_input(
+            "予測客数", min_value=100, max_value=6000, value=2400, step=50, key="order_pred_customers"
+        )
         correction_pct = fc2.slider("天気・イベント補正（%）", -30, 50, 0, key="order_correction_pct")
-        current_stock = fc3.number_input("現在の在庫数（個）", min_value=0, max_value=5000, value=120, step=5)
+        current_stock = fc3.number_input(
+            f"現在の在庫（{selected_name}）",
+            min_value=0,
+            max_value=9999,
+            value=order_default_stock,
+            step=1,
+            key=f"order_stock_{product_id}",
+        )
+
+        os1, os2 = st.columns([1, 3])
+        with os1:
+            if st.button("この商品の在庫を登録", key=f"order_save_stock_{product_id}"):
+                save_product_inventory(
+                    str(product_id),
+                    selected_name,
+                    int(current_stock),
+                    int(order_default_safety),
+                    int(order_default_max),
+                )
+                st.success(f"{selected_name} の在庫を登録しました。")
+                st.rerun()
+        with os2:
+            st.caption(
+                "在庫は商品ごとに保存されます。"
+                " **在庫管理** タブの一覧からまとめて登録することもできます。"
+            )
 
         correction_factor = 1.0 + correction_pct / 100.0
         recommended = max(
@@ -1836,12 +1871,17 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
             language="text",
         )
 
-        if recommended > COLD_STORAGE_CAPACITY:
-            st.error(f"推奨発注量が限界収容量（{COLD_STORAGE_CAPACITY:,} 個）を超えています。")
-        elif recommended > COLD_STORAGE_CAPACITY * 0.85:
-            st.warning("収容量の85%を超えています。")
+        projected_total = int(current_stock) + recommended
+        if projected_total > order_default_max:
+            st.error(
+                f"発注後の在庫（{projected_total:,} 個）が収納MAX（{order_default_max:,} 個）を超えます。"
+            )
+        elif projected_total > order_default_max * 0.85:
+            st.warning(
+                f"発注後の在庫が収納MAX（{order_default_max:,} 個）の85%を超えています。"
+            )
         else:
-            st.success("収容容量内の推奨発注量です。")
+            st.success(f"収納MAX（{order_default_max:,} 個）内の推奨発注量です。")
 
 
 def _load_mtg_report_modules() -> tuple[Any, ...]:
@@ -2023,6 +2063,13 @@ def render_mtg_report_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> 
             inventory_summary: dict[str, Any] | None = None
             if include_inventory:
                 inv_safety = int(inv_row["safety_stock"].iloc[0]) if not inv_row.empty else 10
+                inv_max = (
+                    int(inv_row["max_stock"].iloc[0])
+                    if not inv_row.empty and "max_stock" in inv_row.columns
+                    else DEFAULT_MAX_STOCK
+                )
+                if inv_max <= 0:
+                    inv_max = DEFAULT_MAX_STOCK
                 start_date = date.today()
                 projection = build_inventory_projection(
                     daily_df,
@@ -2032,16 +2079,20 @@ def render_mtg_report_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> 
                     int(inv_horizon),
                     load_deliveries_df(pid),
                     safety_stock=inv_safety,
+                    max_stock=inv_max,
                 )
                 end_date = start_date + timedelta(days=int(inv_horizon) - 1)
                 manual_use = load_manual_planned_use(pid, start_date, end_date)
-                projection = apply_planned_consumption(projection, manual_use, inv_safety)
+                projection = apply_planned_consumption(
+                    projection, manual_use, inv_safety, inv_max
+                )
                 stockout_in = days_until_stockout(projection)
                 stockout_label = (
                     f"{stockout_in} 日後" if stockout_in is not None else "なし（期間内は維持）"
                 )
                 inventory_summary = {
                     "safety_stock": inv_safety,
+                    "max_stock": inv_max,
                     "horizon": inv_horizon,
                     "avg_use": float(projection["planned_use"].mean())
                     if not projection.empty
@@ -2056,7 +2107,7 @@ def render_mtg_report_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> 
                 }
                 if include_charts and not projection.empty:
                     chart_images[f"inventory_{pid}"] = plotly_fig_to_png(
-                        plot_inventory_vertical_calendar(projection, pname),
+                        plot_inventory_vertical_calendar(projection, pname, inv_max),
                         width=700,
                         height=max(420, 28 * len(projection)),
                     )
@@ -2131,7 +2182,9 @@ def render_mtg_report_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> 
         )
 
 
-def plot_inventory_vertical_calendar(projection: pd.DataFrame, product_name: str) -> go.Figure:
+def plot_inventory_vertical_calendar(
+    projection: pd.DataFrame, product_name: str, max_stock: int = 0
+) -> go.Figure:
     """縦型: 日付をY軸に予測消費（棒）と予想在庫（線）。"""
     if projection.empty:
         fig = go.Figure()
@@ -2139,7 +2192,9 @@ def plot_inventory_vertical_calendar(projection: pd.DataFrame, product_name: str
         return fig
 
     labels = projection["label"].tolist()
-    colors = projection["status"].map({"out": "#e94560", "low": "#f0ad4e", "ok": "#0f3460"}).tolist()
+    colors = projection["status"].map(
+        {"out": "#e94560", "low": "#f0ad4e", "over": "#8e44ad", "ok": "#0f3460"}
+    ).tolist()
 
     fig = go.Figure()
     use_col = "planned_use" if "planned_use" in projection.columns else "predicted_use"
@@ -2170,7 +2225,18 @@ def plot_inventory_vertical_calendar(projection: pd.DataFrame, product_name: str
         )
     )
     x_max = max(int(use_vals.max()), int(stock_vals.max()), 1)
+    if int(max_stock) > 0:
+        x_max = max(x_max, int(max_stock))
     x_min = min(int(stock_vals.min()), 0)
+    if int(max_stock) > 0:
+        fig.add_vline(
+            x=int(max_stock),
+            line_dash="dash",
+            line_color="#8e44ad",
+            line_width=2,
+            annotation_text=f"MAX {int(max_stock):,}",
+            annotation_position="top right",
+        )
     fig.update_layout(
         title=dict(
             text=f"{product_name} — 在庫消費カレンダー<br><sup>上ほど近い日</sup>",
@@ -2231,6 +2297,7 @@ def format_delivery_display(row: pd.Series) -> str:
 def build_inventory_calendar_editor_df(
     projection: pd.DataFrame,
     delivery_weekdays: list[int] | None = None,
+    max_stock: int = 0,
 ) -> pd.DataFrame:
     """縦型カレンダー（計画消費・納品数列を編集）。"""
     if projection.empty:
@@ -2243,12 +2310,14 @@ def build_inventory_calendar_editor_df(
                 PLAN_CONSUMPTION_COL,
                 DELIVERY_PLAN_COL,
                 "入荷",
+                "収納MAX",
                 "日末在庫",
                 "状態",
             ]
         )
     cal = projection.copy()
-    status_label = {"ok": "🟢", "low": "🟡", "out": "🔴"}
+    status_label = {"ok": "🟢", "low": "🟡", "out": "🔴", "over": "🟣"}
+    max_val = int(max_stock) if int(max_stock) > 0 else DEFAULT_MAX_STOCK
     wd_set = set(delivery_weekdays or [])
 
     def row_marker(r: pd.Series) -> str:
@@ -2279,10 +2348,89 @@ def build_inventory_calendar_editor_df(
             PLAN_CONSUMPTION_COL: cal[use_col].astype(int),
             DELIVERY_PLAN_COL: scheduled.astype(int),
             "入荷": cal.apply(format_delivery_display, axis=1),
-            "日末在庫": cal["stock_end"].astype(int),
+            "収納MAX": max_val,
+            "日末在庫": cal["stock_end"].apply(
+                lambda v: f"{int(v):,} / {max_val:,}"
+            ),
             "状態": cal["状態"],
         }
     )
+
+
+def get_inventory_row_defaults(inv_df: pd.DataFrame, product_id: str) -> tuple[int, int, int]:
+    """在庫CSVから商品ごとの現在庫・安全在庫・収納MAXを取得。"""
+    inv_row = inv_df[inv_df["product_id"].astype(str) == str(product_id)]
+    stock = int(inv_row["current_stock"].iloc[0]) if not inv_row.empty else 0
+    safety = int(inv_row["safety_stock"].iloc[0]) if not inv_row.empty else 10
+    max_stock = int(inv_row["max_stock"].iloc[0]) if not inv_row.empty else DEFAULT_MAX_STOCK
+    if max_stock <= 0:
+        max_stock = DEFAULT_MAX_STOCK
+    return stock, safety, max_stock
+
+
+def render_all_products_stock_editor(product_list: pd.DataFrame, inv_df: pd.DataFrame) -> None:
+    """全フードの在庫を商品ごとに登録。"""
+    st.markdown("##### 全フードの在庫登録")
+    st.caption(
+        "商品ごとに **現在の在庫**・**安全在庫**・**収納MAX（在庫上限）** を入力して保存します。"
+    )
+
+    h1, h2, h3, h4 = st.columns([2, 1, 1, 1])
+    with h1:
+        st.caption("**商品名**")
+    with h2:
+        st.caption("**現在の在庫**")
+    with h3:
+        st.caption("**安全在庫**")
+    with h4:
+        st.caption("**収納MAX**")
+
+    with st.form("all_products_stock_form", clear_on_submit=False):
+        pending: list[tuple[str, str, int, int, int]] = []
+        for _, prow in product_list.iterrows():
+            pid = str(prow["product_id"])
+            pname = str(prow["name"])
+            d_stock, d_safety, d_max = get_inventory_row_defaults(inv_df, pid)
+            c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+            with c1:
+                st.markdown(f"**{pname}**")
+            with c2:
+                stock_val = st.number_input(
+                    "在庫",
+                    min_value=0,
+                    max_value=9999,
+                    value=d_stock,
+                    step=1,
+                    key=f"all_inv_stock_{pid}",
+                    label_visibility="collapsed",
+                )
+            with c3:
+                safety_val = st.number_input(
+                    "安全在庫",
+                    min_value=0,
+                    max_value=500,
+                    value=d_safety,
+                    step=1,
+                    key=f"all_inv_safety_{pid}",
+                    label_visibility="collapsed",
+                )
+            with c4:
+                max_val = st.number_input(
+                    "収納MAX",
+                    min_value=1,
+                    max_value=9999,
+                    value=d_max,
+                    step=5,
+                    key=f"all_inv_max_{pid}",
+                    label_visibility="collapsed",
+                )
+            pending.append((pid, pname, int(stock_val), int(safety_val), int(max_val)))
+
+        if st.form_submit_button("全フードの在庫を保存", type="primary", use_container_width=True):
+            for pid, pname, stock_val, safety_val, max_val in pending:
+                save_product_inventory(pid, pname, stock_val, safety_val, max_val)
+            st.success("全フードの在庫を保存しました。")
+            st.rerun()
 
 
 def render_inventory_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> None:
@@ -2300,33 +2448,23 @@ def render_inventory_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
     init_consumption_plan_csv()
     init_delivery_plan_csv()
     product_list = active_products(products_df)
+    inv_df = load_inventory_df()
+    render_all_products_stock_editor(product_list, inv_df)
 
-    selected_name = st.selectbox("対象フード商品", product_list["name"].tolist(), key="inv_product")
+    st.markdown("##### カレンダー・納品の設定")
+    selected_name = st.selectbox(
+        "カレンダーを表示するフード商品",
+        product_list["name"].tolist(),
+        key="inv_product",
+    )
     selected = product_list[product_list["name"] == selected_name].iloc[0]
     product_id = str(selected["product_id"])
 
-    inv_df = load_inventory_df()
-    inv_row = inv_df[inv_df["product_id"].astype(str) == product_id]
-    default_stock = int(inv_row["current_stock"].iloc[0]) if not inv_row.empty else 0
-    default_safety = int(inv_row["safety_stock"].iloc[0]) if not inv_row.empty else 10
-
-    st.markdown("##### 現在の在庫")
-    c1, c2, c3 = st.columns([1, 1, 1])
-    with c1:
-        current_stock = st.number_input(
-            "現在の在庫（個）", min_value=0, max_value=9999, value=default_stock, step=1, key="inv_stock"
-        )
-    with c2:
-        safety_stock = st.number_input(
-            "安全在庫（個）", min_value=0, max_value=500, value=default_safety, step=1, key="inv_safety"
-        )
-    with c3:
-        st.write("")
-        st.write("")
-        if st.button("在庫を保存", type="primary", use_container_width=True, key="inv_save"):
-            save_product_inventory(product_id, selected_name, int(current_stock), int(safety_stock))
-            st.success("在庫を保存しました。")
-            st.rerun()
+    current_stock, safety_stock, max_stock = get_inventory_row_defaults(inv_df, product_id)
+    st.caption(
+        f"**{selected_name}** の登録: 在庫 **{current_stock:,}** 個"
+        f" / 安全 **{safety_stock:,}** / 収納MAX **{max_stock:,}** — 変更は上の一覧から保存。"
+    )
 
     st.markdown("##### 納品曜日")
     st.caption("納品がある曜日にチェックを入れます。**納品数はカレンダー表に直接入力**してください。")
@@ -2403,6 +2541,8 @@ def render_inventory_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
 
     start_date = date.today()
     end_date = start_date + timedelta(days=int(horizon) - 1)
+    current_stock, safety_stock, max_stock = get_inventory_row_defaults(inv_df, product_id)
+
     projection = build_inventory_projection(
         daily_df,
         product_id,
@@ -2411,30 +2551,35 @@ def render_inventory_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
         int(horizon),
         load_deliveries_df(product_id),
         safety_stock=int(safety_stock),
+        max_stock=int(max_stock),
     )
     manual_use = load_manual_planned_use(product_id, start_date, end_date)
-    projection = apply_planned_consumption(projection, manual_use, int(safety_stock))
+    projection = apply_planned_consumption(
+        projection, manual_use, int(safety_stock), int(max_stock)
+    )
     pred_by_day = {_projection_row_date(row): int(row["predicted_use"]) for _, row in projection.iterrows()}
 
     avg_use = float(projection["planned_use"].mean()) if not projection.empty else 0.0
     stockout_in = days_until_stockout(projection)
     min_stock = int(projection["stock_end"].min()) if not projection.empty else 0
 
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3, m4, m5 = st.columns(5)
     with m1:
         st.metric("計画の平均消費", f"{avg_use:,.1f} 個/日")
     with m2:
-        st.metric(f"{horizon}日後の予想在庫", f"{int(projection['stock_end'].iloc[-1]):,} 個")
+        st.metric("収納MAX", f"{max_stock:,} 個")
     with m3:
-        st.metric("期間内の最低在庫", f"{min_stock:,} 個")
+        st.metric(f"{horizon}日後の予想在庫", f"{int(projection['stock_end'].iloc[-1]):,} 個")
     with m4:
+        st.metric("期間内の最低在庫", f"{min_stock:,} 個")
+    with m5:
         if stockout_in is not None:
             st.metric("在庫切れ予測", f"{stockout_in} 日後", delta="要発注", delta_color="inverse")
         else:
             st.metric("在庫切れ予測", "なし", delta="期間内は維持")
 
     delivery_weekdays = get_delivery_weekdays(product_id)
-    editor_df = build_inventory_calendar_editor_df(projection, delivery_weekdays)
+    editor_df = build_inventory_calendar_editor_df(projection, delivery_weekdays, max_stock)
     pred_by_delivery = {
         _projection_row_date(row): int(row.get("delivery_scheduled", row.get("delivery", 0)))
         for _, row in projection.iterrows()
@@ -2471,7 +2616,7 @@ def render_inventory_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
                     format="%d",
                 ),
             },
-            disabled=["", "日付", "曜日", "予測消費", "入荷", "日末在庫", "状態"],
+            disabled=["", "日付", "曜日", "予測消費", "入荷", "収納MAX", "日末在庫", "状態"],
             hide_index=True,
             use_container_width=True,
             num_rows="fixed",
@@ -2516,11 +2661,13 @@ def render_inventory_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
         st.success("表示期間の納品数をクリアしました。")
         st.rerun()
 
-    st.caption("🔴 不足 · 🟡 注意 · ✎ 手入力 · 納品日＝曜日登録 · 保存後に日末在庫が更新されます")
+    st.caption(
+        "🔴 不足 · 🟡 注意 · 🟣 収納超過 · ✎ 手入力 · 日末在庫は「現在/MAX」表示"
+    )
 
     st.markdown("##### 消費と予想在庫")
     st.plotly_chart(
-        plot_inventory_vertical_calendar(projection, selected_name),
+        plot_inventory_vertical_calendar(projection, selected_name, max_stock),
         use_container_width=True,
         config={"displayModeBar": False, "responsive": True},
     )
