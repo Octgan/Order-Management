@@ -105,6 +105,65 @@ DAILY_SALES_COLUMNS = [
     "created_at",
 ]
 
+MAIN_TAB_OPTIONS = [
+    "Square CSVアップロード",
+    "ダッシュボード・可視化",
+    "在庫管理",
+    "MTGレポート",
+]
+
+DASHBOARD_DETAIL_TABS = [
+    "期間分析（販売数）",
+    "店舗客数",
+    "推移グラフ",
+    "発注予測",
+]
+
+_PLOTLY_CHART_CONFIG = {"displayModeBar": False, "responsive": True}
+
+
+def _file_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+@st.cache_data(show_spinner=False)
+def _cached_read_products(_mtime: float) -> pd.DataFrame:
+    df = pd.read_csv(PRODUCTS_CSV, encoding="utf-8-sig")
+    df["unit_price"] = pd.to_numeric(df["unit_price"], errors="coerce").fillna(0).astype(int)
+    df["is_active"] = pd.to_numeric(df["is_active"], errors="coerce").fillna(1).astype(int)
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def _cached_read_daily_sales(_mtime: float) -> pd.DataFrame:
+    if not DAILY_CSV.exists() or DAILY_CSV.stat().st_size == 0:
+        return pd.DataFrame()
+    df = pd.read_csv(DAILY_CSV, encoding="utf-8-sig")
+    if df.empty:
+        return df
+    df["date"] = pd.to_datetime(df["date"], format="mixed", errors="coerce")
+    df = df.dropna(subset=["date"]).copy()
+    for col in ["total_sales", "total_customers", "unit_price", "units_sold", "product_sales"]:
+        if col not in df.columns:
+            df[col] = 0
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def _cached_read_mappings(_mtime: float) -> pd.DataFrame:
+    if not MAPPINGS_CSV.exists() or MAPPINGS_CSV.stat().st_size == 0:
+        return pd.DataFrame(columns=MAPPING_COLUMNS)
+    return pd.read_csv(MAPPINGS_CSV, encoding="utf-8-sig")
+
+
+@st.cache_data(show_spinner=False)
+def _cached_read_inventory(_mtime: float) -> pd.DataFrame:
+    return load_inventory_df()
+
 
 # ---------------------------------------------------------------------------
 # UI
@@ -288,10 +347,7 @@ def ensure_data_files() -> None:
 
 
 def load_products() -> pd.DataFrame:
-    df = pd.read_csv(PRODUCTS_CSV, encoding="utf-8-sig")
-    df["unit_price"] = pd.to_numeric(df["unit_price"], errors="coerce").fillna(0).astype(int)
-    df["is_active"] = pd.to_numeric(df["is_active"], errors="coerce").fillna(1).astype(int)
-    return df
+    return _cached_read_products(_file_mtime(PRODUCTS_CSV))
 
 
 def active_products(products_df: pd.DataFrame) -> pd.DataFrame:
@@ -304,9 +360,7 @@ def init_empty_mappings_csv() -> None:
 
 
 def load_product_mappings_df() -> pd.DataFrame:
-    if not MAPPINGS_CSV.exists() or MAPPINGS_CSV.stat().st_size == 0:
-        return pd.DataFrame(columns=MAPPING_COLUMNS)
-    return pd.read_csv(MAPPINGS_CSV, encoding="utf-8-sig")
+    return _cached_read_mappings(_file_mtime(MAPPINGS_CSV))
 
 
 def load_product_mappings() -> dict[str, str]:
@@ -411,18 +465,13 @@ def activate_product(product_id: str) -> None:
 
 
 def load_daily_sales() -> pd.DataFrame:
-    if not DAILY_CSV.exists() or DAILY_CSV.stat().st_size == 0:
-        return pd.DataFrame()
-    df = pd.read_csv(DAILY_CSV, encoding="utf-8-sig")
-    if df.empty:
-        return df
-    df["date"] = pd.to_datetime(df["date"], format="mixed", errors="coerce")
-    df = df.dropna(subset=["date"]).copy()
-    for col in ["total_sales", "total_customers", "unit_price", "units_sold", "product_sales"]:
-        if col not in df.columns:
-            df[col] = 0
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-    return df
+    return _cached_read_daily_sales(_file_mtime(DAILY_CSV))
+
+
+def load_inventory_cached() -> pd.DataFrame:
+    from food_stock.logic import INVENTORY_CSV
+
+    return _cached_read_inventory(_file_mtime(INVENTORY_CSV))
 
 
 def allocate_product_sales_from_store(
@@ -1655,7 +1704,7 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
                 all_foods_rate,
             ),
             use_container_width=True,
-            config={"displayModeBar": False, "responsive": True},
+            config=_PLOTLY_CHART_CONFIG,
         )
     if not food_breakdown.empty:
         bd_view = food_breakdown.copy()
@@ -1691,11 +1740,15 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
     )
     sales_trend = trend_df[trend_df["units_sold"] > 0] if not trend_df.empty else trend_df
 
-    tab_sales, tab_customers, tab_charts, tab_order = st.tabs(
-        ["期間分析（販売数）", "店舗客数", "推移グラフ", "発注予測"]
+    detail_tab = st.radio(
+        "詳細分析タブ",
+        DASHBOARD_DETAIL_TABS,
+        horizontal=True,
+        label_visibility="collapsed",
+        key="dashboard_detail_tab",
     )
 
-    with tab_sales:
+    if detail_tab == DASHBOARD_DETAIL_TABS[0]:
         st.caption(f"集計期間: **{period_label}**（{period_stats['days']} 日分の登録データ）")
         ap1, ap2, ap3 = st.columns(3)
         with ap1:
@@ -1721,6 +1774,7 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
                 st.plotly_chart(
                     plot_weekday_avg_units(weekday_units, selected_name, period_label),
                     use_container_width=True,
+                    config=_PLOTLY_CHART_CONFIG,
                 )
             with wk_table:
                 table_view = weekday_units.copy()
@@ -1734,7 +1788,7 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
                 )
             st.caption("各曜日について、指定期間内に登録がある日の販売数の平均です。")
 
-    with tab_customers:
+    elif detail_tab == DASHBOARD_DETAIL_TABS[1]:
         st.caption(f"集計期間: **{period_label}**")
         cp1, cp2, cp3, cp4 = st.columns(4)
         with cp1:
@@ -1756,10 +1810,11 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
             st.plotly_chart(
                 plot_customer_trend(customer_trend, customer_stats["avg"], period_label),
                 use_container_width=True,
+                config=_PLOTLY_CHART_CONFIG,
             )
             st.caption(f"破線は期間平均（**{customer_stats['avg']:,.1f} 人/日**）。")
 
-    with tab_charts:
+    elif detail_tab == DASHBOARD_DETAIL_TABS[2]:
         st.caption(f"集計期間: **{period_label}**（販売数・単品売上高の推移）")
         si1, si2, si3 = st.columns(3)
         with si1:
@@ -1774,13 +1829,18 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
 
         c1, c2 = st.columns([1, 1.4])
         with c1:
-            st.plotly_chart(plot_weekday_comparison(lw_sales, avg_4w, selected_name), use_container_width=True)
+            st.plotly_chart(
+                plot_weekday_comparison(lw_sales, avg_4w, selected_name),
+                use_container_width=True,
+                config=_PLOTLY_CHART_CONFIG,
+            )
             st.caption(f"過去1か月同曜日平均: **{avg_4w:,.1f} 個**")
         with c2:
             if not trend_df.empty:
                 st.plotly_chart(
                     plot_daily_trend(trend_df, selected_name, period_label),
                     use_container_width=True,
+                    config=_PLOTLY_CHART_CONFIG,
                 )
             else:
                 st.info("指定期間の販売数データがありません。")
@@ -1797,15 +1857,16 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
                     float(single_item_stats["avg"]),
                 ),
                 use_container_width=True,
+                config=_PLOTLY_CHART_CONFIG,
             )
             st.caption(
                 "各日の **店舗純売上（税抜）÷ 当該商品の販売数**。破線は期間平均（販売あり日のみ）。"
             )
 
-    with tab_order:
+    elif detail_tab == DASHBOARD_DETAIL_TABS[3]:
         init_inventory_csv(products_df)
         sync_inventory_products(products_df)
-        order_inv_df = load_inventory_df()
+        order_inv_df = load_inventory_cached()
         order_default_stock, order_default_safety, order_default_max = get_inventory_row_defaults(
             order_inv_df, str(product_id)
         )
@@ -2282,6 +2343,46 @@ PLAN_CONSUMPTION_COL = "✏️ 計画消費（入力）"
 DELIVERY_PLAN_COL = "📦 納品数（入力）"
 
 
+def extract_calendar_plan_from_editor(
+    edited_df: pd.DataFrame,
+    pred_by_day: dict[date, int],
+) -> tuple[dict[date, int], dict[date, int]]:
+    """カレンダー表の全行から、保存すべき計画消費・納品数を抽出する。"""
+    manual_use: dict[date, int] = {}
+    delivery_plan: dict[date, int] = {}
+    for _, row in edited_df.iterrows():
+        day_val = pd.to_datetime(str(row["日付"])).date()
+        planned = int(row[PLAN_CONSUMPTION_COL])
+        predicted = pred_by_day.get(day_val, planned)
+        if planned != predicted:
+            manual_use[day_val] = planned
+        delivery_qty = int(row[DELIVERY_PLAN_COL])
+        if delivery_qty > 0:
+            delivery_plan[day_val] = delivery_qty
+    return manual_use, delivery_plan
+
+
+def persist_calendar_plan(
+    product_id: str,
+    start_date: date,
+    end_date: date,
+    manual_use: dict[date, int],
+    delivery_plan: dict[date, int],
+) -> None:
+    """表示中のカレンダー内容をそのまま保存する（列ごとの差分ではなく表全体を反映）。"""
+    clear_consumption_plan(product_id, start_date, end_date)
+    if manual_use:
+        save_consumption_plan(product_id, manual_use)
+    clear_delivery_plan(product_id, start_date, end_date)
+    if delivery_plan:
+        save_delivery_plan(product_id, delivery_plan)
+
+
+def clear_calendar_editor_state(product_id: str, horizon: int) -> None:
+    """保存・リセット後に data_editor の古い入力状態を捨てる。"""
+    st.session_state.pop(f"inv_calendar_editor_{product_id}_{horizon}", None)
+
+
 def format_delivery_display(row: pd.Series) -> str:
     total = int(row.get("delivery", 0))
     if total <= 0:
@@ -2436,24 +2537,13 @@ def render_all_products_stock_editor(product_list: pd.DataFrame, inv_df: pd.Data
             st.rerun()
 
 
-def render_inventory_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> None:
-    st.markdown('<p class="section-title">在庫管理</p>', unsafe_allow_html=True)
-    st.caption(
-        "対象は **販売中のフード商品** です（サイドバー「商品・紐づけ設定」で追加した新商品も自動で表示されます）。"
-        " **納品曜日** で曜日を登録し、**納品数** は下のカレンダー表に直接入力します。"
-        " **計画消費** も同じ表で編集でき、保存後に日末在庫が再計算されます。"
-    )
-
-    products_df = load_products()
-    init_inventory_csv(products_df)
-    sync_inventory_products(products_df)
-    init_deliveries_csv()
-    init_consumption_plan_csv()
-    init_delivery_plan_csv()
-    product_list = active_products(products_df)
-    inv_df = load_inventory_df()
-    render_all_products_stock_editor(product_list, inv_df)
-
+@st.fragment
+def _render_inventory_calendar_section(
+    daily_df: pd.DataFrame,
+    product_list: pd.DataFrame,
+    inv_df: pd.DataFrame,
+) -> None:
+    """在庫カレンダー部分のみ再描画し、在庫一覧などの再計算を避ける。"""
     st.markdown("##### カレンダー・納品の設定")
     selected_name = st.selectbox(
         "カレンダーを表示するフード商品",
@@ -2583,84 +2673,76 @@ def render_inventory_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
 
     delivery_weekdays = get_delivery_weekdays(product_id)
     editor_df = build_inventory_calendar_editor_df(projection, delivery_weekdays, max_stock)
-    pred_by_delivery = {
-        _projection_row_date(row): int(row.get("delivery_scheduled", row.get("delivery", 0)))
-        for _, row in projection.iterrows()
-    }
+    editor_key = f"inv_calendar_editor_{product_id}_{horizon}"
 
     st.markdown("##### 縦型カレンダー")
     st.caption(
-        f"**{PLAN_CONSUMPTION_COL}** と **{DELIVERY_PLAN_COL}** を編集できます。"
+        f"**{PLAN_CONSUMPTION_COL}** と **{DELIVERY_PLAN_COL}** を編集し、"
+        " **「カレンダーを保存して在庫を再計算」** を押すと入力内容が保存されます。"
         " 入荷列の **（臨時）** は上の「臨時の入荷」で追加した分です。"
     )
 
-    save_plan = False
-    reset_plan = False
-    reset_delivery = False
+    edited_df = st.data_editor(
+        editor_df,
+        key=editor_key,
+        column_config={
+            PLAN_CONSUMPTION_COL: st.column_config.NumberColumn(
+                PLAN_CONSUMPTION_COL,
+                help="その日に使う個数",
+                min_value=0,
+                max_value=9999,
+                step=1,
+                format="%d",
+            ),
+            DELIVERY_PLAN_COL: st.column_config.NumberColumn(
+                DELIVERY_PLAN_COL,
+                help="その日の納品数（隔週など日ごとに変えられます）",
+                min_value=0,
+                max_value=9999,
+                step=1,
+                format="%d",
+            ),
+        },
+        disabled=["", "日付", "曜日", "予測消費", "入荷", "収納MAX", "日末在庫", "状態"],
+        hide_index=True,
+        use_container_width=True,
+        num_rows="fixed",
+    )
 
-    with st.form("inv_calendar_plan_form", clear_on_submit=False):
-        edited_df = st.data_editor(
-            editor_df,
-            column_config={
-                PLAN_CONSUMPTION_COL: st.column_config.NumberColumn(
-                    PLAN_CONSUMPTION_COL,
-                    help="その日に使う個数",
-                    min_value=0,
-                    max_value=9999,
-                    step=1,
-                    format="%d",
-                ),
-                DELIVERY_PLAN_COL: st.column_config.NumberColumn(
-                    DELIVERY_PLAN_COL,
-                    help="その日の納品数（隔週など日ごとに変えられます）",
-                    min_value=0,
-                    max_value=9999,
-                    step=1,
-                    format="%d",
-                ),
-            },
-            disabled=["", "日付", "曜日", "予測消費", "入荷", "収納MAX", "日末在庫", "状態"],
-            hide_index=True,
-            use_container_width=True,
-            num_rows="fixed",
+    btn_save, btn_reset, btn_reset_del = st.columns(3)
+    with btn_save:
+        save_plan = st.button(
+            "カレンダーを保存して在庫を再計算",
+            type="primary",
+            key=f"inv_save_plan_{product_id}_{horizon}",
         )
-        btn_save, btn_reset, btn_reset_del = st.columns(3)
-        with btn_save:
-            save_plan = st.form_submit_button("カレンダーを保存して在庫を再計算", type="primary")
-        with btn_reset:
-            reset_plan = st.form_submit_button("計画消費を予測に戻す")
-        with btn_reset_del:
-            reset_delivery = st.form_submit_button("納品数をクリア")
+    with btn_reset:
+        reset_plan = st.button(
+            "計画消費を予測に戻す",
+            key=f"inv_reset_plan_{product_id}_{horizon}",
+        )
+    with btn_reset_del:
+        reset_delivery = st.button(
+            "納品数をクリア",
+            key=f"inv_reset_delivery_{product_id}_{horizon}",
+        )
 
     if save_plan:
-        use_deltas: dict[date, int] = {}
-        delivery_deltas: dict[date, int] = {}
-        for _, row in edited_df.iterrows():
-            day_val = pd.to_datetime(str(row["日付"])).date()
-            planned = int(row[PLAN_CONSUMPTION_COL])
-            predicted = pred_by_day.get(day_val, planned)
-            if planned != predicted:
-                use_deltas[day_val] = planned
-            delivery_qty = int(row[DELIVERY_PLAN_COL])
-            base_delivery = pred_by_delivery.get(day_val, 0)
-            if delivery_qty != base_delivery:
-                delivery_deltas[day_val] = delivery_qty
-        clear_consumption_plan(product_id, start_date, end_date)
-        if use_deltas:
-            save_consumption_plan(product_id, use_deltas)
-        clear_delivery_plan(product_id, start_date, end_date)
-        if delivery_deltas:
-            save_delivery_plan(product_id, delivery_deltas)
+        manual_use, delivery_plan = extract_calendar_plan_from_editor(edited_df, pred_by_day)
+        persist_calendar_plan(product_id, start_date, end_date, manual_use, delivery_plan)
+        clear_calendar_editor_state(product_id, int(horizon))
         st.success("カレンダーを保存し、在庫見込みを更新しました。")
         st.rerun()
 
     if reset_plan:
         clear_consumption_plan(product_id, start_date, end_date)
+        clear_calendar_editor_state(product_id, int(horizon))
         st.success("計画消費を予測に戻しました。")
         st.rerun()
 
     if reset_delivery:
         clear_delivery_plan(product_id, start_date, end_date)
+        clear_calendar_editor_state(product_id, int(horizon))
         st.success("表示期間の納品数をクリアしました。")
         st.rerun()
 
@@ -2672,14 +2754,35 @@ def render_inventory_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
     st.plotly_chart(
         plot_inventory_vertical_calendar(projection, selected_name, max_stock),
         use_container_width=True,
-        config={"displayModeBar": False, "responsive": True},
+        config=_PLOTLY_CHART_CONFIG,
     )
+
+
+def render_inventory_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> None:
+    st.markdown('<p class="section-title">在庫管理</p>', unsafe_allow_html=True)
+    st.caption(
+        "対象は **販売中のフード商品** です（サイドバー「商品・紐づけ設定」で追加した新商品も自動で表示されます）。"
+        " **納品曜日** で曜日を登録し、**納品数** は下のカレンダー表に直接入力します。"
+        " **計画消費** も同じ表で編集でき、保存後に日末在庫が再計算されます。"
+    )
+
+    init_inventory_csv(products_df)
+    sync_inventory_products(products_df)
+    init_deliveries_csv()
+    init_consumption_plan_csv()
+    init_delivery_plan_csv()
+    product_list = active_products(products_df)
+    inv_df = load_inventory_cached()
+    render_all_products_stock_editor(product_list, inv_df)
+    _render_inventory_calendar_section(daily_df, product_list, inv_df)
 
 
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="🍽️", layout="wide")
     inject_css()
-    ensure_data_files()
+    if not st.session_state.get("_data_files_initialized"):
+        ensure_data_files()
+        st.session_state["_data_files_initialized"] = True
 
     products_df = load_products()
     daily_df = load_daily_sales()
@@ -2708,6 +2811,7 @@ def main() -> None:
             st.rerun()
         if st.button("全データをリセット", type="secondary", use_container_width=True):
             reset_application_data()
+            st.session_state["_data_files_initialized"] = True
             st.success("データを初期化しました。")
             st.rerun()
 
@@ -2729,16 +2833,20 @@ def main() -> None:
     elif side_view == "商品・紐づけ設定":
         render_products_mappings_tab(products_df)
     else:
-        t_csv, t_dash, t_inv, t_mtg = st.tabs(
-            ["Square CSVアップロード", "ダッシュボード・可視化", "在庫管理", "MTGレポート"]
+        main_tab = st.radio(
+            "メイン画面",
+            MAIN_TAB_OPTIONS,
+            horizontal=True,
+            label_visibility="collapsed",
+            key="main_work_tab",
         )
-        with t_csv:
+        if main_tab == MAIN_TAB_OPTIONS[0]:
             render_square_upload_tab(products_df, daily_df)
-        with t_dash:
+        elif main_tab == MAIN_TAB_OPTIONS[1]:
             render_dashboard_tab(products_df, daily_df)
-        with t_inv:
+        elif main_tab == MAIN_TAB_OPTIONS[2]:
             render_inventory_tab(products_df, daily_df)
-        with t_mtg:
+        else:
             render_mtg_report_tab(products_df, daily_df)
 
 
