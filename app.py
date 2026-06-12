@@ -59,6 +59,7 @@ from square_csv import (
     set_custom_product_mappings,
     summarize_square_row_mapping,
 )
+import shared_storage as store
 
 # ---------------------------------------------------------------------------
 # 設定
@@ -68,7 +69,7 @@ COLD_STORAGE_CAPACITY = 300
 DATA_VERSION = 5  # 仕様変更時に上げると data/ を初期化（4→5は税抜へ戻す）
 STANDARD_CONSUMPTION_TAX_RATE = 0.10
 
-DATA_DIR = Path(__file__).resolve().parent / "data"
+DATA_DIR = store.DATA_DIR
 PRODUCTS_CSV = DATA_DIR / "products.csv"
 MAPPINGS_CSV = DATA_DIR / "product_mappings.csv"
 DAILY_CSV = DATA_DIR / "daily_sales.csv"
@@ -129,9 +130,15 @@ def _file_mtime(path: Path) -> float:
         return 0.0
 
 
+def clear_data_caches() -> None:
+    _cached_read_products.clear()
+    _cached_read_daily_sales.clear()
+    _cached_read_mappings.clear()
+
+
 @st.cache_data(show_spinner=False)
 def _cached_read_products(_mtime: float) -> pd.DataFrame:
-    df = pd.read_csv(PRODUCTS_CSV, encoding="utf-8-sig")
+    df = store.read_csv(PRODUCTS_CSV)
     df["unit_price"] = pd.to_numeric(df["unit_price"], errors="coerce").fillna(0).astype(int)
     df["is_active"] = pd.to_numeric(df["is_active"], errors="coerce").fillna(1).astype(int)
     return df
@@ -141,7 +148,7 @@ def _cached_read_products(_mtime: float) -> pd.DataFrame:
 def _cached_read_daily_sales(_mtime: float) -> pd.DataFrame:
     if not DAILY_CSV.exists() or DAILY_CSV.stat().st_size == 0:
         return pd.DataFrame()
-    df = pd.read_csv(DAILY_CSV, encoding="utf-8-sig")
+    df = store.read_csv(DAILY_CSV)
     if df.empty:
         return df
     df["date"] = pd.to_datetime(df["date"], format="mixed", errors="coerce")
@@ -157,12 +164,26 @@ def _cached_read_daily_sales(_mtime: float) -> pd.DataFrame:
 def _cached_read_mappings(_mtime: float) -> pd.DataFrame:
     if not MAPPINGS_CSV.exists() or MAPPINGS_CSV.stat().st_size == 0:
         return pd.DataFrame(columns=MAPPING_COLUMNS)
-    return pd.read_csv(MAPPINGS_CSV, encoding="utf-8-sig")
+    return store.read_csv(MAPPINGS_CSV)
 
 
-@st.cache_data(show_spinner=False)
-def _cached_read_inventory(_mtime: float) -> pd.DataFrame:
-    return load_inventory_df()
+def reset_inventory_input_widgets(
+    product_list: pd.DataFrame | None = None,
+    *,
+    product_id: str | None = None,
+) -> None:
+    """在庫保存後に number_input の古い session_state を捨て、CSV の値を反映させる。"""
+    if product_list is not None:
+        for _, prow in product_list.iterrows():
+            pid = str(prow["product_id"])
+            for key in (
+                f"all_inv_stock_{pid}",
+                f"all_inv_safety_{pid}",
+                f"all_inv_max_{pid}",
+            ):
+                st.session_state.pop(key, None)
+    if product_id is not None:
+        st.session_state.pop(f"order_stock_{product_id}", None)
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +261,7 @@ def migrate_v4_to_tax_exclusive() -> None:
     products_df["unit_price"] = products_df["unit_price"].apply(
         lambda p: tax_exclusive_price(int(p))
     )
-    products_df.to_csv(PRODUCTS_CSV, index=False, encoding="utf-8-sig")
+    store.write_csv(products_df, PRODUCTS_CSV)
 
     daily_df = load_daily_sales()
     if not daily_df.empty:
@@ -258,9 +279,9 @@ def migrate_v4_to_tax_exclusive() -> None:
                     .apply(tax_exclusive_price)
                     .astype(int)
                 )
-        daily_df.to_csv(DAILY_CSV, index=False, encoding="utf-8-sig")
+        store.write_csv(daily_df, DAILY_CSV)
 
-    VERSION_FILE.write_text(str(DATA_VERSION), encoding="utf-8")
+    store.write_text(VERSION_FILE, str(DATA_VERSION))
 
 
 def is_daily_data_empty(daily_df: pd.DataFrame | None = None) -> bool:
@@ -284,7 +305,7 @@ def show_empty_data_notice() -> None:
 # データ永続化
 # ---------------------------------------------------------------------------
 def init_empty_daily_csv() -> None:
-    pd.DataFrame(columns=DAILY_SALES_COLUMNS).to_csv(DAILY_CSV, index=False, encoding="utf-8-sig")
+    store.write_csv(pd.DataFrame(columns=DAILY_SALES_COLUMNS), DAILY_CSV)
 
 
 def write_default_products() -> None:
@@ -299,7 +320,7 @@ def write_default_products() -> None:
         }
         for idx, p in enumerate(DEFAULT_PRODUCTS, start=1)
     ]
-    pd.DataFrame(rows).to_csv(PRODUCTS_CSV, index=False, encoding="utf-8-sig")
+    store.write_csv(pd.DataFrame(rows), PRODUCTS_CSV)
 
 
 def reset_application_data() -> None:
@@ -312,7 +333,7 @@ def reset_application_data() -> None:
     init_consumption_plan_csv()
     if not MAPPINGS_CSV.exists():
         init_empty_mappings_csv()
-    VERSION_FILE.write_text(str(DATA_VERSION), encoding="utf-8")
+    store.write_text(VERSION_FILE, str(DATA_VERSION))
     sync_square_mappings()
 
 
@@ -321,7 +342,7 @@ def ensure_data_files() -> None:
     stored_version = 0
     if VERSION_FILE.exists():
         try:
-            stored_version = int(VERSION_FILE.read_text(encoding="utf-8").strip())
+            stored_version = int(store.read_text(VERSION_FILE).strip())
         except ValueError:
             stored_version = 0
 
@@ -329,7 +350,7 @@ def ensure_data_files() -> None:
         if stored_version == 4 and DATA_VERSION >= 5:
             migrate_v4_to_tax_exclusive()
         elif stored_version == 3 and DATA_VERSION >= 5:
-            VERSION_FILE.write_text(str(DATA_VERSION), encoding="utf-8")
+            store.write_text(VERSION_FILE, str(DATA_VERSION))
         else:
             reset_application_data()
         return
@@ -356,7 +377,7 @@ def active_products(products_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def init_empty_mappings_csv() -> None:
-    pd.DataFrame(columns=MAPPING_COLUMNS).to_csv(MAPPINGS_CSV, index=False, encoding="utf-8-sig")
+    store.write_csv(pd.DataFrame(columns=MAPPING_COLUMNS), MAPPINGS_CSV)
 
 
 def load_product_mappings_df() -> pd.DataFrame:
@@ -397,7 +418,7 @@ def save_product_mapping(square_label: str, product_name: str) -> None:
         ],
         ignore_index=True,
     )
-    df.to_csv(MAPPINGS_CSV, index=False, encoding="utf-8-sig")
+    store.write_csv(df, MAPPINGS_CSV)
     sync_square_mappings()
 
 
@@ -408,7 +429,7 @@ def delete_product_mapping(square_label: str) -> None:
     if df.empty:
         init_empty_mappings_csv()
     else:
-        df.to_csv(MAPPINGS_CSV, index=False, encoding="utf-8-sig")
+        store.write_csv(df, MAPPINGS_CSV)
     sync_square_mappings()
 
 
@@ -442,36 +463,30 @@ def add_product(name: str, unit_price: int) -> None:
             ],
             ignore_index=True,
         )
-    products_df.to_csv(PRODUCTS_CSV, index=False, encoding="utf-8-sig")
+    store.write_csv(products_df, PRODUCTS_CSV)
     sync_inventory_products(products_df)
 
 
 def update_product_price(product_id: str, unit_price: int) -> None:
     products_df = load_products()
     products_df.loc[products_df["product_id"] == product_id, "unit_price"] = int(unit_price)
-    products_df.to_csv(PRODUCTS_CSV, index=False, encoding="utf-8-sig")
+    store.write_csv(products_df, PRODUCTS_CSV)
 
 
 def deactivate_product(product_id: str) -> None:
     products_df = load_products()
     products_df.loc[products_df["product_id"] == product_id, "is_active"] = 0
-    products_df.to_csv(PRODUCTS_CSV, index=False, encoding="utf-8-sig")
+    store.write_csv(products_df, PRODUCTS_CSV)
 
 
 def activate_product(product_id: str) -> None:
     products_df = load_products()
     products_df.loc[products_df["product_id"] == product_id, "is_active"] = 1
-    products_df.to_csv(PRODUCTS_CSV, index=False, encoding="utf-8-sig")
+    store.write_csv(products_df, PRODUCTS_CSV)
 
 
 def load_daily_sales() -> pd.DataFrame:
     return _cached_read_daily_sales(_file_mtime(DAILY_CSV))
-
-
-def load_inventory_cached() -> pd.DataFrame:
-    from food_stock.logic import INVENTORY_CSV
-
-    return _cached_read_inventory(_file_mtime(INVENTORY_CSV))
 
 
 def allocate_product_sales_from_store(
@@ -555,7 +570,7 @@ def save_daily_input(
         )
 
     merged = pd.concat([daily_df, pd.DataFrame(rows)], ignore_index=True)
-    merged.to_csv(DAILY_CSV, index=False, encoding="utf-8-sig")
+    store.write_csv(merged, DAILY_CSV)
 
 
 def delete_daily_record(target_date: date) -> None:
@@ -566,7 +581,7 @@ def delete_daily_record(target_date: date) -> None:
     if daily_df.empty:
         init_empty_daily_csv()
     else:
-        daily_df.to_csv(DAILY_CSV, index=False, encoding="utf-8-sig")
+        store.write_csv(daily_df, DAILY_CSV)
 
 
 def get_daily_record_by_date(daily_df: pd.DataFrame, target_date: date) -> tuple[dict[str, int], dict[str, int]]:
@@ -614,7 +629,7 @@ def purge_meaningless_days() -> int:
     if removed == 0:
         return 0
     if keep_parts:
-        pd.concat(keep_parts, ignore_index=True).to_csv(DAILY_CSV, index=False, encoding="utf-8-sig")
+        store.write_csv(pd.concat(keep_parts, ignore_index=True), DAILY_CSV)
     else:
         init_empty_daily_csv()
     return removed
@@ -1866,7 +1881,7 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
     elif detail_tab == DASHBOARD_DETAIL_TABS[3]:
         init_inventory_csv(products_df)
         sync_inventory_products(products_df)
-        order_inv_df = load_inventory_cached()
+        order_inv_df = load_inventory_df()
         order_default_stock, order_default_safety, order_default_max = get_inventory_row_defaults(
             order_inv_df, str(product_id)
         )
@@ -1899,6 +1914,7 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
                     int(order_default_safety),
                     int(order_default_max),
                 )
+                reset_inventory_input_widgets(product_id=str(product_id))
                 st.success(f"{selected_name} の在庫を登録しました。")
                 st.rerun()
         with os2:
@@ -2533,6 +2549,7 @@ def render_all_products_stock_editor(product_list: pd.DataFrame, inv_df: pd.Data
         if st.form_submit_button("全フードの在庫を保存", type="primary", use_container_width=True):
             for pid, pname, stock_val, safety_val, max_val in pending:
                 save_product_inventory(pid, pname, stock_val, safety_val, max_val)
+            reset_inventory_input_widgets(product_list)
             st.success("全フードの在庫を保存しました。")
             st.rerun()
 
@@ -2541,9 +2558,9 @@ def render_all_products_stock_editor(product_list: pd.DataFrame, inv_df: pd.Data
 def _render_inventory_calendar_section(
     daily_df: pd.DataFrame,
     product_list: pd.DataFrame,
-    inv_df: pd.DataFrame,
 ) -> None:
     """在庫カレンダー部分のみ再描画し、在庫一覧などの再計算を避ける。"""
+    inv_df = load_inventory_df()
     st.markdown("##### カレンダー・納品の設定")
     selected_name = st.selectbox(
         "カレンダーを表示するフード商品",
@@ -2772,17 +2789,27 @@ def render_inventory_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
     init_consumption_plan_csv()
     init_delivery_plan_csv()
     product_list = active_products(products_df)
-    inv_df = load_inventory_cached()
+    inv_df = load_inventory_df()
     render_all_products_stock_editor(product_list, inv_df)
-    _render_inventory_calendar_section(daily_df, product_list, inv_df)
+    _render_inventory_calendar_section(daily_df, product_list)
 
 
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="🍽️", layout="wide")
     inject_css()
+
+    if store.is_cloud_enabled():
+        first_sync = not st.session_state.get("_cloud_initial_sync")
+        store.ensure_cloud_sync(force=first_sync)
+        if first_sync:
+            st.session_state["_cloud_initial_sync"] = True
+            clear_data_caches()
+
     if not st.session_state.get("_data_files_initialized"):
         ensure_data_files()
         st.session_state["_data_files_initialized"] = True
+        if store.is_cloud_enabled():
+            store.push_all_to_cloud()
 
     products_df = load_products()
     daily_df = load_daily_sales()
@@ -2812,8 +2839,32 @@ def main() -> None:
         if st.button("全データをリセット", type="secondary", use_container_width=True):
             reset_application_data()
             st.session_state["_data_files_initialized"] = True
+            if store.is_cloud_enabled():
+                store.push_all_to_cloud()
             st.success("データを初期化しました。")
             st.rerun()
+
+        st.divider()
+        st.markdown("### データ同期")
+        st.caption(store.cloud_status_label())
+        if store.is_cloud_enabled():
+            if st.button("クラウドから最新を取得", type="secondary", use_container_width=True):
+                store.ensure_cloud_sync(force=True)
+                clear_data_caches()
+                st.rerun()
+            if st.button("この端末のデータをクラウドへ送信", type="secondary", use_container_width=True):
+                uploaded, upload_errors = store.push_all_to_cloud()
+                if upload_errors:
+                    st.warning("一部のファイルを送信できませんでした。")
+                    for msg in upload_errors[:3]:
+                        st.caption(msg)
+                else:
+                    st.success(f"クラウドへ {uploaded} 件のデータを送信しました。")
+        else:
+            st.caption(
+                "複数端末で共有するには Supabase を設定してください。"
+                "（`.streamlit/secrets.toml.example` を参照）"
+            )
 
         st.divider()
         st.markdown("### 設定・修正")

@@ -9,7 +9,9 @@ from typing import Any
 
 import pandas as pd
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+import shared_storage as store
+
+DATA_DIR = store.DATA_DIR
 INVENTORY_CSV = DATA_DIR / "inventory.csv"
 DELIVERIES_CSV = DATA_DIR / "inventory_deliveries.csv"
 CONSUMPTION_PLAN_CSV = DATA_DIR / "inventory_consumption_plan.csv"
@@ -62,27 +64,25 @@ def init_inventory_csv(products_df: pd.DataFrame) -> None:
         for _, row in products_df.iterrows()
         if int(row.get("is_active", 1)) == 1
     ]
-    pd.DataFrame(rows, columns=INVENTORY_COLUMNS).to_csv(INVENTORY_CSV, index=False, encoding="utf-8-sig")
+    store.write_csv(pd.DataFrame(rows, columns=INVENTORY_COLUMNS), INVENTORY_CSV)
 
 
 def init_deliveries_csv() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not DELIVERIES_CSV.exists() or DELIVERIES_CSV.stat().st_size == 0:
-        pd.DataFrame(columns=DELIVERY_COLUMNS).to_csv(DELIVERIES_CSV, index=False, encoding="utf-8-sig")
+        store.write_csv(pd.DataFrame(columns=DELIVERY_COLUMNS), DELIVERIES_CSV)
 
 
 def init_consumption_plan_csv() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not CONSUMPTION_PLAN_CSV.exists() or CONSUMPTION_PLAN_CSV.stat().st_size == 0:
-        pd.DataFrame(columns=CONSUMPTION_PLAN_COLUMNS).to_csv(
-            CONSUMPTION_PLAN_CSV, index=False, encoding="utf-8-sig"
-        )
+        store.write_csv(pd.DataFrame(columns=CONSUMPTION_PLAN_COLUMNS), CONSUMPTION_PLAN_CSV)
 
 
 def load_consumption_plan_df(product_id: str | None = None) -> pd.DataFrame:
     if not CONSUMPTION_PLAN_CSV.exists() or CONSUMPTION_PLAN_CSV.stat().st_size == 0:
         return pd.DataFrame(columns=CONSUMPTION_PLAN_COLUMNS)
-    df = pd.read_csv(CONSUMPTION_PLAN_CSV, encoding="utf-8-sig")
+    df = store.read_csv(CONSUMPTION_PLAN_CSV)
     df["planned_use"] = pd.to_numeric(df["planned_use"], errors="coerce").fillna(0).astype(int)
     df["plan_date"] = pd.to_datetime(df["plan_date"], errors="coerce").dt.date
     if product_id:
@@ -134,7 +134,7 @@ def save_consumption_plan(product_id: str, planned_by_day: dict[date, int]) -> N
     if df.empty:
         init_consumption_plan_csv()
     else:
-        df.to_csv(CONSUMPTION_PLAN_CSV, index=False, encoding="utf-8-sig")
+        store.write_csv(df, CONSUMPTION_PLAN_CSV)
 
 
 def clear_consumption_plan(product_id: str, start_date: date, end_date: date) -> None:
@@ -147,21 +147,19 @@ def clear_consumption_plan(product_id: str, start_date: date, end_date: date) ->
     if df.empty:
         init_consumption_plan_csv()
     else:
-        df.to_csv(CONSUMPTION_PLAN_CSV, index=False, encoding="utf-8-sig")
+        store.write_csv(df, CONSUMPTION_PLAN_CSV)
 
 
 def init_delivery_plan_csv() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not DELIVERY_PLAN_CSV.exists() or DELIVERY_PLAN_CSV.stat().st_size == 0:
-        pd.DataFrame(columns=DELIVERY_PLAN_COLUMNS).to_csv(
-            DELIVERY_PLAN_CSV, index=False, encoding="utf-8-sig"
-        )
+        store.write_csv(pd.DataFrame(columns=DELIVERY_PLAN_COLUMNS), DELIVERY_PLAN_CSV)
 
 
 def load_delivery_plan_df(product_id: str | None = None) -> pd.DataFrame:
     if not DELIVERY_PLAN_CSV.exists() or DELIVERY_PLAN_CSV.stat().st_size == 0:
         return pd.DataFrame(columns=DELIVERY_PLAN_COLUMNS)
-    df = pd.read_csv(DELIVERY_PLAN_CSV, encoding="utf-8-sig")
+    df = store.read_csv(DELIVERY_PLAN_CSV)
     df["delivery_qty"] = pd.to_numeric(df["delivery_qty"], errors="coerce").fillna(0).astype(int)
     df["plan_date"] = pd.to_datetime(df["plan_date"], errors="coerce").dt.date
     if product_id:
@@ -213,7 +211,7 @@ def save_delivery_plan(product_id: str, delivery_by_day: dict[date, int]) -> Non
     if df.empty:
         init_delivery_plan_csv()
     else:
-        df.to_csv(DELIVERY_PLAN_CSV, index=False, encoding="utf-8-sig")
+        store.write_csv(df, DELIVERY_PLAN_CSV)
 
 
 def clear_delivery_plan(product_id: str, start_date: date, end_date: date) -> None:
@@ -226,7 +224,7 @@ def clear_delivery_plan(product_id: str, start_date: date, end_date: date) -> No
     if df.empty:
         init_delivery_plan_csv()
     else:
-        df.to_csv(DELIVERY_PLAN_CSV, index=False, encoding="utf-8-sig")
+        store.write_csv(df, DELIVERY_PLAN_CSV)
 
 
 def get_delivery_weekdays(product_id: str) -> list[int]:
@@ -281,7 +279,7 @@ def save_delivery_weekdays(product_id: str, weekdays: list[int]) -> None:
             ],
             ignore_index=True,
         )
-    df.to_csv(INVENTORY_CSV, index=False, encoding="utf-8-sig")
+    store.write_csv(df, INVENTORY_CSV)
 
 
 def sync_inventory_products(products_df: pd.DataFrame) -> None:
@@ -289,7 +287,7 @@ def sync_inventory_products(products_df: pd.DataFrame) -> None:
     if not INVENTORY_CSV.exists() or INVENTORY_CSV.stat().st_size == 0:
         init_inventory_csv(products_df)
         return
-    inv = pd.read_csv(INVENTORY_CSV, encoding="utf-8-sig")
+    inv = store.read_csv(INVENTORY_CSV)
     existing = set(inv["product_id"].astype(str))
     now = datetime.now().isoformat()
     new_rows: list[dict[str, Any]] = []
@@ -324,7 +322,7 @@ def sync_inventory_products(products_df: pd.DataFrame) -> None:
         inv = pd.concat([inv, pd.DataFrame(new_rows)], ignore_index=True)
         changed = True
     if changed:
-        inv.to_csv(INVENTORY_CSV, index=False, encoding="utf-8-sig")
+        store.write_csv(inv, INVENTORY_CSV)
 
 
 def _coerce_inventory_text_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -340,7 +338,7 @@ def _coerce_inventory_text_columns(df: pd.DataFrame) -> pd.DataFrame:
 def load_inventory_df() -> pd.DataFrame:
     if not INVENTORY_CSV.exists() or INVENTORY_CSV.stat().st_size == 0:
         return pd.DataFrame(columns=INVENTORY_COLUMNS)
-    df = pd.read_csv(INVENTORY_CSV, encoding="utf-8-sig", dtype=str, keep_default_na=False)
+    df = store.read_csv(INVENTORY_CSV, dtype=str, keep_default_na=False)
     for col in INVENTORY_COLUMNS:
         if col not in df.columns:
             if col in ("delivery_weekdays", "delivery_by_weekday", "delivery_by_weekday_parity"):
@@ -468,7 +466,7 @@ def save_weekday_delivery_schedule(product_id: str, schedule: dict[int, int]) ->
             ],
             ignore_index=True,
         )
-    df.to_csv(INVENTORY_CSV, index=False, encoding="utf-8-sig")
+    store.write_csv(df, INVENTORY_CSV)
 
 
 def week_parity_iso(d: date) -> int:
@@ -616,7 +614,7 @@ def save_weekday_delivery_schedule_parity(
             ignore_index=True,
         )
 
-    df.to_csv(INVENTORY_CSV, index=False, encoding="utf-8-sig")
+    store.write_csv(df, INVENTORY_CSV)
 
 
 def build_combined_delivery_maps(
@@ -687,13 +685,13 @@ def save_product_inventory(
             ],
             ignore_index=True,
         )
-    df.to_csv(INVENTORY_CSV, index=False, encoding="utf-8-sig")
+    store.write_csv(df, INVENTORY_CSV)
 
 
 def load_deliveries_df(product_id: str | None = None) -> pd.DataFrame:
     if not DELIVERIES_CSV.exists() or DELIVERIES_CSV.stat().st_size == 0:
         return pd.DataFrame(columns=DELIVERY_COLUMNS)
-    df = pd.read_csv(DELIVERIES_CSV, encoding="utf-8-sig")
+    df = store.read_csv(DELIVERIES_CSV)
     df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0).astype(int)
     df["delivery_date"] = pd.to_datetime(df["delivery_date"], errors="coerce").dt.date
     if product_id:
@@ -717,7 +715,7 @@ def add_delivery(product_id: str, delivery_date: date, quantity: int, memo: str 
         ]
     )
     df = pd.concat([df, row], ignore_index=True)
-    df.to_csv(DELIVERIES_CSV, index=False, encoding="utf-8-sig")
+    store.write_csv(df, DELIVERIES_CSV)
 
 
 def delete_delivery(delivery_id: str) -> None:
@@ -726,7 +724,7 @@ def delete_delivery(delivery_id: str) -> None:
     if df.empty:
         init_deliveries_csv()
     else:
-        df.to_csv(DELIVERIES_CSV, index=False, encoding="utf-8-sig")
+        store.write_csv(df, DELIVERIES_CSV)
 
 
 def predict_daily_units(
