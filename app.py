@@ -27,7 +27,6 @@ try:
         apply_planned_consumption,
         build_inventory_projection,
         clear_consumption_plan,
-        clear_delivery_plan,
         days_until_stockout,
         delete_delivery,
         get_delivery_weekdays,
@@ -38,8 +37,8 @@ try:
         load_deliveries_df,
         load_inventory_df,
         load_manual_planned_use,
+        replace_delivery_plan_for_period,
         save_consumption_plan,
-        save_delivery_plan,
         save_delivery_weekdays,
         save_product_inventory,
         sync_inventory_products,
@@ -167,23 +166,35 @@ def _cached_read_mappings(_mtime: float) -> pd.DataFrame:
     return store.read_csv(MAPPINGS_CSV)
 
 
+def stock_form_revision() -> int:
+    return int(st.session_state.get("inv_stock_form_rev", 0))
+
+
+def bump_stock_form_revision() -> None:
+    st.session_state["inv_stock_form_rev"] = stock_form_revision() + 1
+
+
+def stock_input_widget_keys(product_id: str, rev: int | None = None) -> tuple[str, str, str]:
+    rev_val = stock_form_revision() if rev is None else rev
+    pid = str(product_id)
+    return (
+        f"all_inv_stock_{pid}_{rev_val}",
+        f"all_inv_safety_{pid}_{rev_val}",
+        f"all_inv_max_{pid}_{rev_val}",
+    )
+
+
 def reset_inventory_input_widgets(
     product_list: pd.DataFrame | None = None,
     *,
     product_id: str | None = None,
 ) -> None:
-    """在庫保存後に number_input の古い session_state を捨て、CSV の値を反映させる。"""
+    """在庫保存後に入力ウィジェットを初期化する。"""
     if product_list is not None:
-        for _, prow in product_list.iterrows():
-            pid = str(prow["product_id"])
-            for key in (
-                f"all_inv_stock_{pid}",
-                f"all_inv_safety_{pid}",
-                f"all_inv_max_{pid}",
-            ):
-                st.session_state.pop(key, None)
+        bump_stock_form_revision()
     if product_id is not None:
-        st.session_state.pop(f"order_stock_{product_id}", None)
+        rev_key = f"order_stock_rev_{product_id}"
+        st.session_state[rev_key] = int(st.session_state.get(rev_key, 0)) + 1
 
 
 # ---------------------------------------------------------------------------
@@ -1895,29 +1906,35 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
             "予測客数", min_value=100, max_value=6000, value=2400, step=50, key="order_pred_customers"
         )
         correction_pct = fc2.slider("天気・イベント補正（%）", -30, 50, 0, key="order_correction_pct")
-        current_stock = fc3.number_input(
-            f"現在の在庫（{selected_name}）",
-            min_value=0,
-            max_value=9999,
-            value=order_default_stock,
-            step=1,
-            key=f"order_stock_{product_id}",
-        )
 
-        os1, os2 = st.columns([1, 3])
-        with os1:
-            if st.button("この商品の在庫を登録", key=f"order_save_stock_{product_id}"):
-                save_product_inventory(
-                    str(product_id),
-                    selected_name,
-                    int(current_stock),
-                    int(order_default_safety),
-                    int(order_default_max),
+        order_stock_rev = int(st.session_state.get(f"order_stock_rev_{product_id}", 0))
+        with fc3:
+            with st.form(f"order_stock_form_{product_id}_{order_stock_rev}", clear_on_submit=False):
+                current_stock = st.number_input(
+                    f"現在の在庫（{selected_name}）",
+                    min_value=0,
+                    max_value=9999,
+                    value=order_default_stock,
+                    step=1,
                 )
-                reset_inventory_input_widgets(product_id=str(product_id))
-                st.success(f"{selected_name} の在庫を登録しました。")
-                st.rerun()
-        with os2:
+                save_stock = st.form_submit_button("在庫を登録", use_container_width=True)
+
+        if save_stock:
+            save_product_inventory(
+                str(product_id),
+                selected_name,
+                int(current_stock),
+                int(order_default_safety),
+                int(order_default_max),
+            )
+            reset_inventory_input_widgets(product_id=str(product_id))
+            st.success(f"{selected_name} の在庫を登録しました。")
+            st.rerun()
+
+        os_caption = st.columns([1, 3])
+        with os_caption[0]:
+            st.write("")
+        with os_caption[1]:
             st.caption(
                 "在庫は商品ごとに保存されます。"
                 " **在庫管理** タブの一覧からまとめて登録することもできます。"
@@ -2372,9 +2389,7 @@ def extract_calendar_plan_from_editor(
         predicted = pred_by_day.get(day_val, planned)
         if planned != predicted:
             manual_use[day_val] = planned
-        delivery_qty = int(row[DELIVERY_PLAN_COL])
-        if delivery_qty > 0:
-            delivery_plan[day_val] = delivery_qty
+        delivery_plan[day_val] = max(0, int(row[DELIVERY_PLAN_COL]))
     return manual_use, delivery_plan
 
 
@@ -2385,18 +2400,26 @@ def persist_calendar_plan(
     manual_use: dict[date, int],
     delivery_plan: dict[date, int],
 ) -> None:
-    """表示中のカレンダー内容をそのまま保存する（列ごとの差分ではなく表全体を反映）。"""
+    """表示中のカレンダー内容をそのまま保存する（納品数0も反映）。"""
     clear_consumption_plan(product_id, start_date, end_date)
     if manual_use:
         save_consumption_plan(product_id, manual_use)
-    clear_delivery_plan(product_id, start_date, end_date)
-    if delivery_plan:
-        save_delivery_plan(product_id, delivery_plan)
+    replace_delivery_plan_for_period(product_id, start_date, end_date, delivery_plan)
 
 
-def clear_calendar_editor_state(product_id: str, horizon: int) -> None:
-    """保存・リセット後に data_editor の古い入力状態を捨てる。"""
-    st.session_state.pop(f"inv_calendar_editor_{product_id}_{horizon}", None)
+def calendar_editor_revision_key(product_id: str, horizon: int) -> str:
+    return f"inv_calendar_rev_{product_id}_{horizon}"
+
+
+def calendar_editor_widget_key(product_id: str, horizon: int) -> str:
+    rev = int(st.session_state.get(calendar_editor_revision_key(product_id, horizon), 0))
+    return f"inv_calendar_editor_{product_id}_{horizon}_{rev}"
+
+
+def bump_calendar_editor_revision(product_id: str, horizon: int) -> None:
+    """保存・リセット後に data_editor を初期表示へ戻す。"""
+    rev_key = calendar_editor_revision_key(product_id, horizon)
+    st.session_state[rev_key] = int(st.session_state.get(rev_key, 0)) + 1
 
 
 def format_delivery_display(row: pd.Series) -> str:
@@ -2505,53 +2528,71 @@ def render_all_products_stock_editor(product_list: pd.DataFrame, inv_df: pd.Data
     with h4:
         st.caption("**収納MAX**")
 
-    with st.form("all_products_stock_form", clear_on_submit=False):
-        pending: list[tuple[str, str, int, int, int]] = []
+    with st.form(
+        f"all_products_stock_form_{stock_form_revision()}",
+        clear_on_submit=False,
+    ):
         for _, prow in product_list.iterrows():
             pid = str(prow["product_id"])
             pname = str(prow["name"])
             d_stock, d_safety, d_max = get_inventory_row_defaults(inv_df, pid)
+            stock_key, safety_key, max_key = stock_input_widget_keys(pid)
             c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
             with c1:
                 st.markdown(f"**{pname}**")
             with c2:
-                stock_val = st.number_input(
+                st.number_input(
                     "在庫",
                     min_value=0,
                     max_value=9999,
                     value=d_stock,
                     step=1,
-                    key=f"all_inv_stock_{pid}",
+                    key=stock_key,
                     label_visibility="collapsed",
                 )
             with c3:
-                safety_val = st.number_input(
+                st.number_input(
                     "安全在庫",
                     min_value=0,
                     max_value=500,
                     value=d_safety,
                     step=1,
-                    key=f"all_inv_safety_{pid}",
+                    key=safety_key,
                     label_visibility="collapsed",
                 )
             with c4:
-                max_val = st.number_input(
+                st.number_input(
                     "収納MAX",
                     min_value=1,
                     max_value=9999,
                     value=d_max,
                     step=5,
-                    key=f"all_inv_max_{pid}",
+                    key=max_key,
                     label_visibility="collapsed",
                 )
-            pending.append((pid, pname, int(stock_val), int(safety_val), int(max_val)))
 
-        if st.form_submit_button("全フードの在庫を保存", type="primary", use_container_width=True):
-            for pid, pname, stock_val, safety_val, max_val in pending:
-                save_product_inventory(pid, pname, stock_val, safety_val, max_val)
-            reset_inventory_input_widgets(product_list)
-            st.success("全フードの在庫を保存しました。")
-            st.rerun()
+        submitted = st.form_submit_button(
+            "全フードの在庫を保存",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if submitted:
+        rev = stock_form_revision()
+        for _, prow in product_list.iterrows():
+            pid = str(prow["product_id"])
+            pname = str(prow["name"])
+            stock_key, safety_key, max_key = stock_input_widget_keys(pid, rev)
+            save_product_inventory(
+                pid,
+                pname,
+                int(st.session_state[stock_key]),
+                int(st.session_state[safety_key]),
+                int(st.session_state[max_key]),
+            )
+        bump_stock_form_revision()
+        st.success("全フードの在庫を保存しました。")
+        st.rerun()
 
 
 @st.fragment
@@ -2690,76 +2731,74 @@ def _render_inventory_calendar_section(
 
     delivery_weekdays = get_delivery_weekdays(product_id)
     editor_df = build_inventory_calendar_editor_df(projection, delivery_weekdays, max_stock)
-    editor_key = f"inv_calendar_editor_{product_id}_{horizon}"
+    editor_key = calendar_editor_widget_key(product_id, int(horizon))
 
     st.markdown("##### 縦型カレンダー")
     st.caption(
         f"**{PLAN_CONSUMPTION_COL}** と **{DELIVERY_PLAN_COL}** を編集し、"
         " **「カレンダーを保存して在庫を再計算」** を押すと入力内容が保存されます。"
+        " 納品数を **0** にするとその日の納品は削除されます。"
         " 入荷列の **（臨時）** は上の「臨時の入荷」で追加した分です。"
     )
 
-    edited_df = st.data_editor(
-        editor_df,
-        key=editor_key,
-        column_config={
-            PLAN_CONSUMPTION_COL: st.column_config.NumberColumn(
-                PLAN_CONSUMPTION_COL,
-                help="その日に使う個数",
-                min_value=0,
-                max_value=9999,
-                step=1,
-                format="%d",
-            ),
-            DELIVERY_PLAN_COL: st.column_config.NumberColumn(
-                DELIVERY_PLAN_COL,
-                help="その日の納品数（隔週など日ごとに変えられます）",
-                min_value=0,
-                max_value=9999,
-                step=1,
-                format="%d",
-            ),
-        },
-        disabled=["", "日付", "曜日", "予測消費", "入荷", "収納MAX", "日末在庫", "状態"],
-        hide_index=True,
-        use_container_width=True,
-        num_rows="fixed",
-    )
+    with st.form(
+        f"inv_calendar_form_{product_id}_{horizon}",
+        clear_on_submit=False,
+    ):
+        edited_df = st.data_editor(
+            editor_df,
+            key=editor_key,
+            column_config={
+                PLAN_CONSUMPTION_COL: st.column_config.NumberColumn(
+                    PLAN_CONSUMPTION_COL,
+                    help="その日に使う個数",
+                    min_value=0,
+                    max_value=9999,
+                    step=1,
+                    format="%d",
+                ),
+                DELIVERY_PLAN_COL: st.column_config.NumberColumn(
+                    DELIVERY_PLAN_COL,
+                    help="その日の納品数（隔週など日ごとに変えられます）",
+                    min_value=0,
+                    max_value=9999,
+                    step=1,
+                    format="%d",
+                ),
+            },
+            disabled=["", "日付", "曜日", "予測消費", "入荷", "収納MAX", "日末在庫", "状態"],
+            hide_index=True,
+            use_container_width=True,
+            num_rows="fixed",
+        )
 
-    btn_save, btn_reset, btn_reset_del = st.columns(3)
-    with btn_save:
-        save_plan = st.button(
-            "カレンダーを保存して在庫を再計算",
-            type="primary",
-            key=f"inv_save_plan_{product_id}_{horizon}",
-        )
-    with btn_reset:
-        reset_plan = st.button(
-            "計画消費を予測に戻す",
-            key=f"inv_reset_plan_{product_id}_{horizon}",
-        )
-    with btn_reset_del:
-        reset_delivery = st.button(
-            "納品数をクリア",
-            key=f"inv_reset_delivery_{product_id}_{horizon}",
-        )
+        btn_save, btn_reset, btn_reset_del = st.columns(3)
+        with btn_save:
+            save_plan = st.form_submit_button(
+                "カレンダーを保存して在庫を再計算",
+                type="primary",
+            )
+        with btn_reset:
+            reset_plan = st.form_submit_button("計画消費を予測に戻す")
+        with btn_reset_del:
+            reset_delivery = st.form_submit_button("納品数をクリア")
 
     if save_plan:
         manual_use, delivery_plan = extract_calendar_plan_from_editor(edited_df, pred_by_day)
         persist_calendar_plan(product_id, start_date, end_date, manual_use, delivery_plan)
-        clear_calendar_editor_state(product_id, int(horizon))
+        bump_calendar_editor_revision(product_id, int(horizon))
         st.success("カレンダーを保存し、在庫見込みを更新しました。")
         st.rerun()
 
     if reset_plan:
         clear_consumption_plan(product_id, start_date, end_date)
-        clear_calendar_editor_state(product_id, int(horizon))
+        bump_calendar_editor_revision(product_id, int(horizon))
         st.success("計画消費を予測に戻しました。")
         st.rerun()
 
     if reset_delivery:
-        clear_delivery_plan(product_id, start_date, end_date)
-        clear_calendar_editor_state(product_id, int(horizon))
+        replace_delivery_plan_for_period(product_id, start_date, end_date, {})
+        bump_calendar_editor_revision(product_id, int(horizon))
         st.success("表示期間の納品数をクリアしました。")
         st.rerun()
 

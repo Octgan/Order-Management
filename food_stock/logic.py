@@ -219,12 +219,32 @@ def clear_delivery_plan(product_id: str, start_date: date, end_date: date) -> No
     if df.empty:
         return
     pid = str(product_id)
-    mask = (df["product_id"].astype(str) == pid) & (df["plan_date"] >= start_date) & (df["plan_date"] <= end_date)
+    plan_dates = df["plan_date"].apply(
+        lambda d: d.date() if isinstance(d, pd.Timestamp) else d
+    )
+    mask = (
+        (df["product_id"].astype(str) == pid)
+        & (plan_dates >= start_date)
+        & (plan_dates <= end_date)
+    )
     df = df[~mask]
     if df.empty:
         init_delivery_plan_csv()
     else:
         store.write_csv(df, DELIVERY_PLAN_CSV)
+
+
+def replace_delivery_plan_for_period(
+    product_id: str,
+    start_date: date,
+    end_date: date,
+    delivery_by_day: dict[date, int],
+) -> None:
+    """表示期間の納品数をカレンダー表の内容で置き換え（0は削除）。"""
+    clear_delivery_plan(product_id, start_date, end_date)
+    positive = {d: int(v) for d, v in delivery_by_day.items() if int(v) > 0}
+    if positive:
+        save_delivery_plan(product_id, positive)
 
 
 def get_delivery_weekdays(product_id: str) -> list[int]:
