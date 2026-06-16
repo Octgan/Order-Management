@@ -165,21 +165,24 @@ def push_all_to_cloud() -> tuple[int, list[str]]:
     return count, errors
 
 
-def ensure_cloud_sync(*, force: bool = False, ttl_seconds: int = 45) -> None:
-    """セッション中は一定間隔でクラウドから取得（force=True で即時）。"""
+def ensure_cloud_sync(*, force: bool = False, ttl_seconds: int = 45) -> int:
+    """セッション中は一定間隔でクラウドから取得（force=True で即時）。戻り値=取得したファイル数。"""
     if not is_cloud_enabled():
-        return
+        return 0
     try:
         import streamlit as st
 
         last = float(st.session_state.get("_cloud_sync_at", 0.0))
         now = time.time()
         if force or now - last >= ttl_seconds:
-            sync_all_from_cloud()
+            count, _errors = sync_all_from_cloud()
             st.session_state["_cloud_sync_at"] = now
+            return count
     except Exception:
         if force or time.time() - _last_sync_at >= ttl_seconds:
-            sync_all_from_cloud()
+            count, _errors = sync_all_from_cloud()
+            return count
+    return 0
 
 
 def cloud_status_label() -> str:

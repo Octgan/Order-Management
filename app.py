@@ -652,6 +652,10 @@ def bulk_import_days(imports: list[DayImport], products_df: pd.DataFrame, overwr
     existing_dates = set(daily_df["date"].dt.date.tolist()) if not daily_df.empty else set()
     created, updated = 0, 0
     product_list = active_products(products_df)
+    product_names = product_list["name"].astype(str).tolist()
+    import_dates: set[date] = set()
+    new_rows: list[dict[str, Any]] = []
+    now = datetime.now().isoformat()
 
     for day_data in imports:
         if day_data.day in existing_dates:
@@ -660,22 +664,38 @@ def bulk_import_days(imports: list[DayImport], products_df: pd.DataFrame, overwr
             updated += 1
         else:
             created += 1
-        units = {name: day_data.units_by_product.get(name, 0) for name in product_list["name"].astype(str)}
-        sales = {}
+        import_dates.add(day_data.day)
+        units = {name: day_data.units_by_product.get(name, 0) for name in product_names}
+        sales: dict[str, int] = {}
         if day_data.product_sales_by_product:
-            sales = {
-                name: day_data.product_sales_by_product.get(name, 0)
-                for name in product_list["name"].astype(str)
-            }
-        save_daily_input(
-            day_data.day,
-            day_data.total_sales,
-            day_data.total_customers,
-            units,
-            product_list,
-            product_sales_by_product=sales or None,
-        )
+            sales = {name: day_data.product_sales_by_product.get(name, 0) for name in product_names}
+        if not sales:
+            sales = allocate_product_sales_from_store(day_data.total_sales, units)
+        target_ts = to_ts(day_data.day)
+        for _, row in product_list.iterrows():
+            name = str(row["name"])
+            new_rows.append(
+                {
+                    "date": target_ts.strftime("%Y-%m-%d"),
+                    "total_sales": int(day_data.total_sales),
+                    "total_customers": int(day_data.total_customers),
+                    "product_id": row["product_id"],
+                    "product_name": name,
+                    "unit_price": int(row["unit_price"]),
+                    "units_sold": int(units.get(name, 0)),
+                    "product_sales": int(sales.get(name, 0)),
+                    "created_at": now,
+                }
+            )
 
+    if not new_rows:
+        return 0, 0
+
+    if not daily_df.empty:
+        daily_df = daily_df[~daily_df["date"].dt.date.isin(import_dates)]
+    merged = pd.concat([daily_df, pd.DataFrame(new_rows)], ignore_index=True)
+    store.write_csv(merged, DAILY_CSV)
+    clear_data_caches()
     return created, updated
 
 
@@ -1246,6 +1266,39 @@ def plot_single_item_sales_trend(
 # ---------------------------------------------------------------------------
 # タブUI
 # ---------------------------------------------------------------------------
+_PENDING_CSV_KEY = "pending_csv_import_payload"
+_CSV_KIND_LABELS = {
+    "product_matrix": "商品別マトリックス",
+    "product_period_summary": "商品売上サマリー（期間）",
+    "sales_summary": "売上サマリー",
+    "unknown": "未判定",
+}
+
+
+def _serialize_day_import(day_data: DayImport) -> dict[str, Any]:
+    return {
+        "day": day_data.day.isoformat(),
+        "total_sales": int(day_data.total_sales),
+        "total_customers": int(day_data.total_customers),
+        "units_by_product": dict(day_data.units_by_product),
+        "product_sales_by_product": dict(day_data.product_sales_by_product or {}),
+    }
+
+
+def _deserialize_day_import(payload: dict[str, Any]) -> DayImport:
+    return DayImport(
+        date.fromisoformat(str(payload["day"])),
+        int(payload["total_sales"]),
+        int(payload["total_customers"]),
+        dict(payload["units_by_product"]),
+        dict(payload.get("product_sales_by_product") or {}) or None,
+    )
+
+
+def _clear_pending_csv_payload() -> None:
+    st.session_state.pop(_PENDING_CSV_KEY, None)
+
+
 def render_square_upload_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> None:
     st.markdown('<p class="section-title">Square売上CSVアップロード（ルートB）</p>', unsafe_allow_html=True)
     st.caption(
@@ -1261,54 +1314,81 @@ def render_square_upload_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) 
     )
     overwrite = st.checkbox("既存日付のデータは上書きする", value=True)
 
-    if not uploaded_list:
+    if uploaded_list:
+        files = uploaded_list if isinstance(uploaded_list, list) else [uploaded_list]
+        if len(files) > 2:
+            st.error("アップロードは2ファイルまでにしてください。")
+            _clear_pending_csv_payload()
+            return
+        try:
+            imports, warnings = parse_dual_csv_upload(files, products_df)
+        except Exception as exc:
+            st.error(f"CSVの読み込みに失敗しました: {exc}")
+            _clear_pending_csv_payload()
+            return
+        if not imports:
+            st.warning("取り込み可能な日次データがありませんでした。")
+            _clear_pending_csv_payload()
+            return
+
+        file_labels: list[dict[str, str]] = []
+        mapping_records: list[dict[str, Any]] = []
+        for f in files:
+            kind, product_df_raw = load_uploaded_dataframe(f, products_df)
+            file_labels.append({"name": f.name, "kind": kind})
+            if kind in ("product_matrix", "product_period_summary"):
+                mapping_df = summarize_square_row_mapping(product_df_raw, products_df)
+                if not mapping_df.empty:
+                    mapping_records.extend(mapping_df.to_dict("records"))
+
+        st.session_state[_PENDING_CSV_KEY] = {
+            "imports": [_serialize_day_import(d) for d in imports],
+            "warnings": warnings,
+            "file_labels": file_labels,
+            "mapping_records": mapping_records,
+        }
+
+    payload = st.session_state.get(_PENDING_CSV_KEY)
+    if not payload:
         if is_daily_data_empty(daily_df):
             st.info(EMPTY_DATA_MESSAGE)
             st.markdown(
-                f"1. **商品別**の横持ちCSV（登録フード品目の日別販売数・売上）  \n"
+                "1. **商品別**の横持ちCSV（登録フード品目の日別販売数・売上）  \n"
                 "2. **売上サマリー**のCSV（日別の総客数・店舗総売上）  \n"
-                "3. 2枚をまとめてドラッグ＆ドロップ → 「データを一括取り込み」→ 下のプレビューで確認"
+                "3. 2枚をまとめてドラッグ＆ドロップ → プレビュー確認 → **「データを一括取り込み」** を押す"
             )
         else:
             st.info("CSVをアップロードすると、取り込みプレビューが表示されます。")
         return
 
-    files = uploaded_list if isinstance(uploaded_list, list) else [uploaded_list]
-    if len(files) > 2:
-        st.error("アップロードは2ファイルまでにしてください。")
-        return
-
-    try:
-        imports, warnings = parse_dual_csv_upload(files, products_df)
-    except Exception as exc:
-        st.error(f"CSVの読み込みに失敗しました: {exc}")
-        return
-
-    if not imports:
-        st.warning("取り込み可能な日次データがありませんでした。")
-        return
+    imports = [_deserialize_day_import(item) for item in payload["imports"]]
+    warnings = list(payload.get("warnings") or [])
+    file_labels = list(payload.get("file_labels") or [])
+    mapping_records = list(payload.get("mapping_records") or [])
 
     existing_dates = set(daily_df["date"].dt.date.tolist()) if not daily_df.empty else set()
     overlap = [d.day for d in imports if d.day in existing_dates]
     if overlap:
         st.warning(f"既存データと重複する日付: {len(overlap)}日（上書き: {'ON' if overwrite else 'OFF'}）")
 
+    st.info(
+        f"取り込み待ち: **{len(imports)}** 日分のプレビューがあります。"
+        " 内容を確認したら下のボタンで保存してください。"
+    )
     import_ready = st.button("データを一括取り込み", type="primary", use_container_width=True)
     if import_ready:
         created, updated = bulk_import_days(imports, products_df, overwrite=overwrite)
-        st.success(f"取り込み完了: 新規 {created} 日 / 上書き {updated} 日")
-        st.rerun()
+        if created == 0 and updated == 0:
+            st.warning("保存された日がありません。上書きOFFで重複日のみの場合は取り込まれません。")
+        else:
+            _clear_pending_csv_payload()
+            st.success(f"取り込み完了: 新規 {created} 日 / 上書き {updated} 日")
+            st.rerun()
 
     st.markdown("#### アップロードされたファイル")
-    for f in files:
-        kind, _df = load_uploaded_dataframe(f, products_df)
-        label = {
-            "product_matrix": "商品別マトリックス",
-            "product_period_summary": "商品売上サマリー（期間）",
-            "sales_summary": "売上サマリー",
-            "unknown": "未判定",
-        }.get(kind, kind)
-        st.write(f"- **{f.name}** → {label}")
+    for item in file_labels:
+        label = _CSV_KIND_LABELS.get(item.get("kind", ""), item.get("kind", "未判定"))
+        st.write(f"- **{item.get('name', '')}** → {label}")
 
     preview_rows = [
         {
@@ -1322,32 +1402,20 @@ def render_square_upload_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) 
     st.markdown("#### 取り込みプレビュー（日別）")
     st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
 
-    product_file = next(
-        (
-            f
-            for f in files
-            if load_uploaded_dataframe(f, products_df)[0]
-            in ("product_matrix", "product_period_summary")
-        ),
-        None,
-    )
-    if product_file is not None:
-        _kind, product_df_raw = load_uploaded_dataframe(product_file, products_df)
-        mapping_df = summarize_square_row_mapping(product_df_raw, products_df)
-        if not mapping_df.empty:
-            st.markdown("#### 商品名の紐づけ確認（Square → アプリ）")
-            st.caption(
-                "「パイ」などはバリエーション列（ミート／レモンクリーム）と組み合わせて判定します。"
-                " 未紐づけがある場合は取り込み前にご確認ください。"
-            )
-            st.dataframe(mapping_df, use_container_width=True, hide_index=True)
-
-        last_import = imports[-1]
-        st.markdown(f"#### 最終日（{last_import.day}）の8品目プレビュー")
-        unit_preview = pd.DataFrame(
-            [{"商品": k, "販売数": v} for k, v in last_import.units_by_product.items()]
+    if mapping_records:
+        st.markdown("#### 商品名の紐づけ確認（Square → アプリ）")
+        st.caption(
+            "「パイ」などはバリエーション列（ミート／レモンクリーム）と組み合わせて判定します。"
+            " 未紐づけがある場合は取り込み前にご確認ください。"
         )
-        st.dataframe(unit_preview, use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(mapping_records), use_container_width=True, hide_index=True)
+
+    last_import = imports[-1]
+    st.markdown(f"#### 最終日（{last_import.day}）の8品目プレビュー")
+    unit_preview = pd.DataFrame(
+        [{"商品": k, "販売数": v} for k, v in last_import.units_by_product.items()]
+    )
+    st.dataframe(unit_preview, use_container_width=True, hide_index=True)
 
     for msg in warnings[:8]:
         st.caption(f"⚠ {msg}")
@@ -2839,9 +2907,10 @@ def main() -> None:
 
     if store.is_cloud_enabled():
         first_sync = not st.session_state.get("_cloud_initial_sync")
-        store.ensure_cloud_sync(force=first_sync)
+        synced = store.ensure_cloud_sync(force=first_sync)
         if first_sync:
             st.session_state["_cloud_initial_sync"] = True
+        if first_sync or synced > 0:
             clear_data_caches()
 
     if not st.session_state.get("_data_files_initialized"):
@@ -2871,6 +2940,7 @@ def main() -> None:
         if st.button("ゴミ日データを削除", type="secondary", use_container_width=True):
             n = purge_meaningless_days()
             if n:
+                clear_data_caches()
                 st.success(f"販売ゼロ・極小の日を {n} 日分削除しました。")
             else:
                 st.info("削除対象の日はありませんでした。")
@@ -2878,6 +2948,8 @@ def main() -> None:
         if st.button("全データをリセット", type="secondary", use_container_width=True):
             reset_application_data()
             st.session_state["_data_files_initialized"] = True
+            _clear_pending_csv_payload()
+            clear_data_caches()
             if store.is_cloud_enabled():
                 store.push_all_to_cloud()
             st.success("データを初期化しました。")
