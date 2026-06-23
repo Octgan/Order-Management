@@ -22,7 +22,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 try:
-    from food_stock import (
+    from food_stock.logic import (
         add_delivery,
         apply_calendar_inputs,
         apply_planned_consumption,

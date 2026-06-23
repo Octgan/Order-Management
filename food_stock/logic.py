@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+CALENDAR_API_VERSION = 2
+
 import json
 from datetime import date, datetime, timedelta
 from pathlib import Path
