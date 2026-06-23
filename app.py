@@ -2632,7 +2632,6 @@ def build_inventory_calendar_editor_df(
                 PLAN_CONSUMPTION_COL,
                 DELIVERY_PLAN_COL,
                 EFFECTIVE_USE_COL,
-                "開始在庫",
                 "入荷",
                 "収納MAX",
                 "日末在庫",
@@ -2686,7 +2685,6 @@ def build_inventory_calendar_editor_df(
             PLAN_CONSUMPTION_COL: cal[use_col].astype(int),
             DELIVERY_PLAN_COL: scheduled.astype(int),
             EFFECTIVE_USE_COL: cal[effective_col].astype(int),
-            "開始在庫": cal["stock_start"].astype(int),
             "入荷": cal.apply(format_delivery_display, axis=1),
             "収納MAX": max_val,
             "日末在庫": cal["stock_end"].apply(
@@ -2819,7 +2817,7 @@ def _render_inventory_calendar_section(
         f"**{selected_name}** の登録: **今日の開始在庫 {current_stock:,}** 個"
         f" / 安全 **{safety_stock:,}** / 収納MAX **{max_stock:,}**"
         " — 上の一覧で保存した数値が起点です。"
-        " 表の **開始在庫** はその日の朝時点、**日末在庫** は消費・入荷後の終わりの数です。"
+        " **日末在庫** はその日の消費・入荷後の数です。"
     )
 
     st.markdown("##### 納品曜日")
@@ -2959,7 +2957,7 @@ def _render_inventory_calendar_section(
                     format="%d",
                 ),
             },
-            disabled=["", "日付", "曜日", "予測消費", EFFECTIVE_USE_COL, "開始在庫", "入荷", "収納MAX", "日末在庫", "状態"],
+            disabled=["", "日付", "曜日", "予測消費", EFFECTIVE_USE_COL, "入荷", "収納MAX", "日末在庫", "状態"],
             hide_index=True,
             use_container_width=True,
             num_rows="fixed",
