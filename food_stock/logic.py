@@ -21,6 +21,8 @@ DELIVERY_PLAN_CSV = DATA_DIR / "inventory_delivery_plan.csv"
 ACTUAL_SALES_CSV = DATA_DIR / "inventory_actual_sales.csv"
 
 DEFAULT_MAX_STOCK = 300
+CALENDAR_TOTAL_DAYS = 30
+CALENDAR_PAST_DAYS = 14
 
 INVENTORY_COLUMNS = [
     "product_id",
@@ -368,7 +370,7 @@ def get_delivery_weekdays(product_id: str) -> list[int]:
     return sorted(base.keys()) if base else []
 
 
-def save_delivery_weekdays(product_id: str, weekdays: list[int]) -> None:
+def save_delivery_weekdays(product_id: str, weekdays: list[int]) -> bool:
     """納品曜日のみ保存（数量はカレンダー表で入力）。"""
     cleaned = sorted({int(w) for w in weekdays if 0 <= int(w) <= 6})
     df = load_inventory_df()
@@ -404,7 +406,7 @@ def save_delivery_weekdays(product_id: str, weekdays: list[int]) -> None:
             ],
             ignore_index=True,
         )
-    store.write_csv(df, INVENTORY_CSV)
+    return store.write_csv(df, INVENTORY_CSV)
 
 
 def sync_inventory_products(products_df: pd.DataFrame) -> None:
@@ -883,6 +885,57 @@ def predict_daily_units(
     return float(sub["units_sold"].mean())
 
 
+def calendar_date_range(today: date | None = None) -> tuple[date, date]:
+    """縦型カレンダー: 過去を含む30日間（今日を含む）。"""
+    anchor = today or date.today()
+    start = anchor - timedelta(days=CALENDAR_PAST_DAYS)
+    end = start + timedelta(days=CALENDAR_TOTAL_DAYS - 1)
+    return start, end
+
+
+def build_inventory_calendar_projection(
+    daily_df: pd.DataFrame,
+    product_id: str,
+    deliveries: pd.DataFrame | None = None,
+    *,
+    today: date | None = None,
+) -> pd.DataFrame:
+    """過去日を含む30日分のカレンダー骨格（在庫は apply_calendar_inputs で計算）。"""
+    anchor = today or date.today()
+    start_date, end_date = calendar_date_range(anchor)
+    delivery_map, scheduled_map, extra_map = build_combined_delivery_maps(
+        product_id, start_date, end_date, deliveries
+    )
+    rows: list[dict[str, Any]] = []
+    for offset in range(CALENDAR_TOTAL_DAYS):
+        day_val = start_date + timedelta(days=offset)
+        predicted = predict_daily_units(daily_df, product_id, day_val)
+        use = max(0, int(round(predicted)))
+        inbound = int(delivery_map.get(day_val, 0))
+        inbound_scheduled = int(scheduled_map.get(day_val, 0))
+        inbound_extra = int(extra_map.get(day_val, 0))
+        weekday = day_val.weekday()
+        rows.append(
+            {
+                "date": day_val,
+                "weekday": weekday,
+                "曜日": WEEKDAY_LABELS_JA[weekday],
+                "label": f"{WEEKDAY_LABELS_JA[weekday]} {day_val.month}/{day_val.day}",
+                "predicted_use": use,
+                "planned_use": use,
+                "delivery": inbound,
+                "delivery_scheduled": inbound_scheduled,
+                "delivery_extra": inbound_extra,
+                "stock_start": 0,
+                "stock_end": 0,
+                "is_today": day_val == anchor,
+                "is_manual": False,
+                "is_actual": False,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def build_inventory_projection(
     daily_df: pd.DataFrame,
     product_id: str,
@@ -990,6 +1043,7 @@ def apply_calendar_inputs(
     actual_by_day: dict[date, int],
     *,
     today: date,
+    opening_stock_today: int,
     safety_stock: int,
     max_stock: int = 0,
 ) -> pd.DataFrame:
@@ -997,12 +1051,15 @@ def apply_calendar_inputs(
     if projection.empty:
         return projection
     out = projection.copy()
-    stock = int(out.iloc[0]["stock_start"])
+    today_idx = 0
+
     for i in range(len(out)):
         row = out.iloc[i]
         day_val = row["date"]
         if isinstance(day_val, pd.Timestamp):
             day_val = day_val.date()
+        if day_val == today:
+            today_idx = i
         predicted = int(row["predicted_use"])
         planned = max(0, int(planned_by_day.get(day_val, row.get("planned_use", predicted))))
         is_manual_planned = day_val in planned_by_day
@@ -1012,24 +1069,53 @@ def apply_calendar_inputs(
             is_actual = True
         else:
             effective = planned
-        inbound = int(row["delivery"])
         out.at[i, "planned_use"] = planned
         out.at[i, "actual_use"] = int(actual_by_day[day_val]) if day_val in actual_by_day else pd.NA
         out.at[i, "effective_use"] = effective
         out.at[i, "is_manual"] = is_manual_planned
         out.at[i, "is_actual"] = is_actual
+
+    stock_at_next_day = int(opening_stock_today)
+    for i in range(today_idx - 1, -1, -1):
+        row = out.iloc[i]
+        effective = int(row["effective_use"])
+        inbound = int(row["delivery"])
+        stock_end = stock_at_next_day
+        stock_start = stock_end + effective - inbound
+        out.at[i, "stock_end"] = stock_end
+        out.at[i, "stock_start"] = stock_start
+        stock_at_next_day = stock_start
+
+    stock = int(opening_stock_today)
+    for i in range(today_idx, len(out)):
+        row = out.iloc[i]
+        effective = int(row["effective_use"])
+        inbound = int(row["delivery"])
         out.at[i, "stock_start"] = stock
         stock_after = stock - effective + inbound
         out.at[i, "stock_end"] = stock_after
         stock = stock_after
+
     return _apply_stock_status(out, safety_stock, max_stock)
 
 
-def days_until_stockout(projection: pd.DataFrame) -> int | None:
-    """在庫切れまでの日数（当日含む）。切れなければ None。"""
+def days_until_stockout(
+    projection: pd.DataFrame, *, from_date: date | None = None
+) -> int | None:
+    """在庫切れまでの日数（from_date 以降、当日含む）。切れなければ None。"""
     if projection.empty:
         return None
-    for i, row in projection.iterrows():
-        if int(row["stock_end"]) < 0:
-            return int(i)
+    start_offset = 0
+    if from_date is not None:
+        for pos in range(len(projection)):
+            row = projection.iloc[pos]
+            day_val = row["date"]
+            if isinstance(day_val, pd.Timestamp):
+                day_val = day_val.date()
+            if day_val >= from_date:
+                start_offset = pos
+                break
+    for i in range(start_offset, len(projection)):
+        if int(projection.iloc[i]["stock_end"]) < 0:
+            return i - start_offset
     return None

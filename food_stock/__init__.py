@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 __all__ = [
+    "CALENDAR_PAST_DAYS",
+    "CALENDAR_TOTAL_DAYS",
     "DEFAULT_MAX_STOCK",
     "add_delivery",
     "apply_calendar_inputs",
     "apply_planned_consumption",
+    "build_inventory_calendar_projection",
     "build_inventory_projection",
+    "calendar_date_range",
     "clear_actual_sales",
     "clear_consumption_plan",
     "clear_delivery_plan",

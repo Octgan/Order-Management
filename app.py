@@ -23,21 +23,22 @@ import streamlit as st
 
 try:
     from food_stock.logic import (
-        add_delivery,
         apply_calendar_inputs,
         apply_planned_consumption,
+        build_inventory_calendar_projection,
         build_inventory_projection,
+        calendar_date_range,
+        CALENDAR_PAST_DAYS,
+        CALENDAR_TOTAL_DAYS,
         clear_actual_sales,
         clear_consumption_plan,
         days_until_stockout,
-        delete_delivery,
         get_delivery_weekdays,
         init_actual_sales_csv,
         init_consumption_plan_csv,
         init_deliveries_csv,
         init_delivery_plan_csv,
         init_inventory_csv,
-        load_deliveries_df,
         load_inventory_df,
         load_manual_actual_sales,
         load_manual_planned_use,
@@ -2276,7 +2277,7 @@ def render_mtg_report_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> 
                     inv_stock,
                     start_date,
                     int(inv_horizon),
-                    load_deliveries_df(pid),
+                    None,
                     safety_stock=inv_safety,
                     max_stock=inv_max,
                 )
@@ -2288,10 +2289,11 @@ def render_mtg_report_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> 
                     manual_use,
                     actual_use,
                     today=start_date,
+                    opening_stock_today=inv_stock,
                     safety_stock=inv_safety,
                     max_stock=inv_max,
                 )
-                stockout_in = days_until_stockout(projection)
+                stockout_in = days_until_stockout(projection, from_date=start_date)
                 stockout_label = (
                     f"{stockout_in} 日後" if stockout_in is not None else "なし（期間内は維持）"
                 )
@@ -2547,18 +2549,47 @@ def persist_calendar_plan(
     return ok
 
 
-def calendar_editor_revision_key(product_id: str, horizon: int) -> str:
-    return f"inv_calendar_rev_{product_id}_{horizon}"
+def calendar_editor_revision_key(product_id: str) -> str:
+    return f"inv_calendar_rev_{product_id}"
 
 
-def calendar_editor_widget_key(product_id: str, horizon: int) -> str:
-    rev = int(st.session_state.get(calendar_editor_revision_key(product_id, horizon), 0))
-    return f"inv_calendar_editor_{product_id}_{horizon}_{rev}"
+def delivery_weekday_checkbox_key(product_id: str, weekday: int) -> str:
+    return f"inv_wd_on_{product_id}_{weekday}"
 
 
-def bump_calendar_editor_revision(product_id: str, horizon: int) -> None:
+def delivery_weekdays_from_session(product_id: str) -> list[int]:
+    """画面上の納品曜日チェック状態を取得。"""
+    return [
+        wd_idx
+        for wd_idx in range(7)
+        if st.session_state.get(delivery_weekday_checkbox_key(product_id, wd_idx), False)
+    ]
+
+
+def persist_delivery_weekdays_from_session(product_id: str) -> bool:
+    """納品曜日を CSV に保存（チェック状態から）。"""
+    return save_delivery_weekdays(product_id, delivery_weekdays_from_session(product_id))
+
+
+def on_delivery_weekday_toggle(product_id: str) -> None:
+    """チェック変更時に納品曜日を即時保存。"""
+    weekdays = delivery_weekdays_from_session(product_id)
+    ok = save_delivery_weekdays(product_id, weekdays)
+    label = weekday_labels_text(weekdays)
+    msg = f"納品曜日を保存しました: {label}"
+    if not ok and store.is_cloud_enabled():
+        msg += "（クラウド送信に失敗しました）"
+    st.session_state[f"inv_wd_notice_{product_id}"] = msg
+
+
+def calendar_editor_widget_key(product_id: str) -> str:
+    rev = int(st.session_state.get(calendar_editor_revision_key(product_id), 0))
+    return f"inv_calendar_editor_{product_id}_{rev}"
+
+
+def bump_calendar_editor_revision(product_id: str) -> None:
     """保存・リセット後に data_editor を初期表示へ戻す。"""
-    rev_key = calendar_editor_revision_key(product_id, horizon)
+    rev_key = calendar_editor_revision_key(product_id)
     st.session_state[rev_key] = int(st.session_state.get(rev_key, 0)) + 1
 
 
@@ -2566,14 +2597,6 @@ def format_delivery_display(row: pd.Series) -> str:
     total = int(row.get("delivery", 0))
     if total <= 0:
         return "—"
-    scheduled = int(row.get("delivery_scheduled", 0))
-    extra = int(row.get("delivery_extra", 0))
-    if scheduled > 0 and extra > 0:
-        return f"+{total}（表{scheduled}+臨{extra}）"
-    if scheduled > 0:
-        return f"+{total}（表入力）"
-    if extra > 0:
-        return f"+{total}（臨時）"
     return f"+{total}"
 
 
@@ -2614,6 +2637,8 @@ def build_inventory_calendar_editor_df(
         if bool(r.get("is_today")):
             return "今日"
         day_val = _projection_row_date(r)
+        if day_val < today_val:
+            return "過去"
         if day_val.weekday() in wd_set:
             return "納品日"
         return ""
@@ -2776,92 +2801,43 @@ def _render_inventory_calendar_section(
     )
 
     st.markdown("##### 納品曜日")
-    st.caption("納品がある曜日にチェックを入れます。**納品数はカレンダー表に直接入力**してください。")
+    st.caption(
+        "納品がある曜日にチェックを入れます。**変更すると自動で保存**され、次回以降も保持されます。"
+        " 納品数はカレンダー表に直接入力してください。"
+    )
 
     weekdays_current = get_delivery_weekdays(product_id)
+    if notice := st.session_state.pop(f"inv_wd_notice_{product_id}", None):
+        st.success(notice)
+
     wd_cols = st.columns(7)
-    new_weekdays: list[int] = []
     for wd_idx, wd_label in enumerate(WEEKDAY_LABELS_JA):
         with wd_cols[wd_idx]:
-            enabled = st.checkbox(
+            st.checkbox(
                 wd_label,
                 value=(wd_idx in weekdays_current),
-                key=f"inv_wd_on_{product_id}_{wd_idx}",
+                key=delivery_weekday_checkbox_key(product_id, wd_idx),
+                on_change=on_delivery_weekday_toggle,
+                args=(product_id,),
             )
-            if enabled:
-                new_weekdays.append(wd_idx)
-
-    if st.button(
-        "納品曜日を保存",
-        type="secondary",
-        use_container_width=True,
-        key="inv_save_weekdays",
-    ):
-        save_delivery_weekdays(product_id, new_weekdays)
-        st.success(f"納品曜日を保存しました: {weekday_labels_text(new_weekdays)}")
-        st.rerun()
 
     if weekdays_current:
         st.caption(f"登録中: **{weekday_labels_text(weekdays_current)}**（カレンダー左列に「納品日」と表示）")
     else:
-        st.caption("納品曜日が未設定です。")
-
-    horizon = st.selectbox(
-        "表示する日数（先の予測）",
-        [7, 14, 21, 30],
-        index=1,
-        format_func=lambda d: f"{d}日間",
-        key="inv_horizon",
-    )
-
-    with st.expander("臨時の入荷（日付を指定）", expanded=False):
-        dcol1, dcol2, dcol3 = st.columns([1, 1, 2])
-        with dcol1:
-            delivery_date = st.date_input("入荷日", value=date.today(), key="inv_delivery_date")
-        with dcol2:
-            delivery_qty = st.number_input("入荷数（個）", min_value=1, max_value=9999, value=50, step=5)
-        with dcol3:
-            delivery_memo = st.text_input("メモ（任意）", key="inv_delivery_memo")
-        if st.button("入荷予定を追加", key="inv_add_delivery"):
-            add_delivery(product_id, delivery_date, int(delivery_qty), delivery_memo)
-            st.success(f"{delivery_date} に {delivery_qty} 個の入荷を登録しました。")
-            st.rerun()
-
-        deliveries_all = load_deliveries_df(product_id)
-        if deliveries_all.empty:
-            st.caption("登録された入荷予定はありません。")
-        else:
-            for _, drow in deliveries_all.iterrows():
-                dcol_a, dcol_b = st.columns([4, 1])
-                d_label = drow["delivery_date"]
-                if hasattr(d_label, "strftime"):
-                    d_label = d_label.strftime("%Y-%m-%d")
-                with dcol_a:
-                    memo = str(drow.get("memo", "") or "")
-                    st.write(f"**{d_label}** — {int(drow['quantity'])} 個 {memo}")
-                with dcol_b:
-                    if st.button("削除", key=f"inv_del_{drow['delivery_id']}"):
-                        delete_delivery(str(drow["delivery_id"]))
-                        st.rerun()
+        st.caption("納品曜日が未設定です。チェックを入れると自動で保存されます。")
 
     if is_daily_data_empty(daily_df):
         st.warning("販売データがないため予測消費を算出できません。CSVを取り込んでからご利用ください。")
         return
 
-    start_date = date.today()
-    today_val = start_date
-    end_date = start_date + timedelta(days=int(horizon) - 1)
+    today_val = date.today()
+    start_date, end_date = calendar_date_range(today_val)
     current_stock, safety_stock, max_stock = get_inventory_row_defaults(inv_df, product_id)
 
-    projection = build_inventory_projection(
+    projection = build_inventory_calendar_projection(
         daily_df,
         product_id,
-        int(current_stock),
-        start_date,
-        int(horizon),
-        load_deliveries_df(product_id),
-        safety_stock=int(safety_stock),
-        max_stock=int(max_stock),
+        today=today_val,
     )
     planned_use = load_manual_planned_use(product_id, start_date, end_date)
     actual_sales = load_manual_actual_sales(product_id, start_date, end_date)
@@ -2870,6 +2846,7 @@ def _render_inventory_calendar_section(
         planned_use,
         actual_sales,
         today=today_val,
+        opening_stock_today=int(current_stock),
         safety_stock=int(safety_stock),
         max_stock=int(max_stock),
     )
@@ -2877,8 +2854,15 @@ def _render_inventory_calendar_section(
     avg_use = float(projection["effective_use"].mean()) if "effective_use" in projection.columns else (
         float(projection["planned_use"].mean()) if not projection.empty else 0.0
     )
-    stockout_in = days_until_stockout(projection)
-    min_stock = int(projection["stock_end"].min()) if not projection.empty else 0
+    stockout_in = days_until_stockout(projection, from_date=today_val)
+    future_mask = projection["date"].apply(
+        lambda d: _projection_row_date(pd.Series({"date": d})) >= today_val
+    )
+    min_stock = (
+        int(projection.loc[future_mask, "stock_end"].min())
+        if future_mask.any()
+        else 0
+    )
 
     m1, m2, m3, m4, m5 = st.columns(5)
     with m1:
@@ -2886,7 +2870,10 @@ def _render_inventory_calendar_section(
     with m2:
         st.metric("収納MAX", f"{max_stock:,} 個")
     with m3:
-        st.metric(f"{horizon}日後の予想在庫", f"{int(projection['stock_end'].iloc[-1]):,} 個")
+        st.metric(
+            f"期末（{end_date.strftime('%m/%d')}）予想在庫",
+            f"{int(projection['stock_end'].iloc[-1]):,} 個",
+        )
     with m4:
         st.metric("期間内の最低在庫", f"{min_stock:,} 個")
     with m5:
@@ -2903,19 +2890,21 @@ def _render_inventory_calendar_section(
         actual_sales,
         today=today_val,
     )
-    editor_key = calendar_editor_widget_key(product_id, int(horizon))
+    editor_key = calendar_editor_widget_key(product_id)
 
     st.markdown("##### 縦型カレンダー")
     st.caption(
-        f"**{ACTUAL_SALES_COL}** は今日以前の実際の販売数（手入力）。"
-        f" **{PLAN_CONSUMPTION_COL}** は今後の見込み消費。"
+        f"**過去{CALENDAR_PAST_DAYS}日〜未来{CALENDAR_TOTAL_DAYS - CALENDAR_PAST_DAYS - 1}日**"
+        f"の **{CALENDAR_TOTAL_DAYS}日間** を表示します。"
+        f" **{ACTUAL_SALES_COL}** は今日以前の実際の販売数（手入力）。"
+        f" **{PLAN_CONSUMPTION_COL}** は見込み消費。"
         f" **{DELIVERY_PLAN_COL}** は納品数。"
         " **「カレンダーを保存して在庫を再計算」** で保存されます。"
         f" **{EFFECTIVE_USE_COL}** は在庫計算に使った消費数です（実売数入力があれば優先）。"
     )
 
     with st.form(
-        f"inv_calendar_form_{product_id}_{horizon}",
+        f"inv_calendar_form_{product_id}",
         clear_on_submit=False,
     ):
         edited_df = st.data_editor(
@@ -2967,6 +2956,7 @@ def _render_inventory_calendar_section(
             reset_delivery = st.form_submit_button("納品数をクリア")
 
     if save_plan:
+        persist_delivery_weekdays_from_session(product_id)
         planned_use, actual_sales_input, delivery_plan = extract_calendar_plan_from_editor(
             edited_df, today=today_val
         )
@@ -2979,7 +2969,7 @@ def _render_inventory_calendar_section(
             delivery_plan,
             today=today_val,
         )
-        bump_calendar_editor_revision(product_id, int(horizon))
+        bump_calendar_editor_revision(product_id)
         if store.is_cloud_enabled() and cloud_ok:
             store.set_persist_notice("カレンダーを保存し、クラウドにも同期しました。", "success")
         elif store.is_cloud_enabled():
@@ -2993,20 +2983,20 @@ def _render_inventory_calendar_section(
 
     if reset_plan:
         clear_consumption_plan(product_id, start_date, end_date)
-        bump_calendar_editor_revision(product_id, int(horizon))
+        bump_calendar_editor_revision(product_id)
         st.success("計画消費を予測に戻しました。")
         st.rerun()
 
     if reset_actual:
         past_end = min(end_date, today_val)
         clear_actual_sales(product_id, start_date, past_end)
-        bump_calendar_editor_revision(product_id, int(horizon))
+        bump_calendar_editor_revision(product_id)
         st.success("表示期間の実売数（手入力）をクリアしました。")
         st.rerun()
 
     if reset_delivery:
         replace_delivery_plan_for_period(product_id, start_date, end_date, {})
-        bump_calendar_editor_revision(product_id, int(horizon))
+        bump_calendar_editor_revision(product_id)
         st.success("表示期間の納品数をクリアしました。")
         st.rerun()
 
