@@ -16,6 +16,7 @@ INVENTORY_CSV = DATA_DIR / "inventory.csv"
 DELIVERIES_CSV = DATA_DIR / "inventory_deliveries.csv"
 CONSUMPTION_PLAN_CSV = DATA_DIR / "inventory_consumption_plan.csv"
 DELIVERY_PLAN_CSV = DATA_DIR / "inventory_delivery_plan.csv"
+ACTUAL_SALES_CSV = DATA_DIR / "inventory_actual_sales.csv"
 
 DEFAULT_MAX_STOCK = 300
 
@@ -34,6 +35,7 @@ INVENTORY_COLUMNS = [
 DELIVERY_COLUMNS = ["delivery_id", "product_id", "delivery_date", "quantity", "memo", "created_at"]
 CONSUMPTION_PLAN_COLUMNS = ["product_id", "plan_date", "planned_use", "updated_at"]
 DELIVERY_PLAN_COLUMNS = ["product_id", "plan_date", "delivery_qty", "updated_at"]
+ACTUAL_SALES_COLUMNS = ["product_id", "sale_date", "actual_units", "updated_at"]
 
 WEEKDAY_LABELS_JA = ["月", "火", "水", "木", "金", "土", "日"]
 
@@ -108,8 +110,8 @@ def load_manual_planned_use(
     return out
 
 
-def save_consumption_plan(product_id: str, planned_by_day: dict[date, int]) -> None:
-    """指定期間の手入力計画消費を保存（0件の日は行を削除）。"""
+def save_consumption_plan(product_id: str, planned_by_day: dict[date, int]) -> bool:
+    """指定期間の手入力計画消費を保存。"""
     init_consumption_plan_csv()
     df = load_consumption_plan_df()
     pid = str(product_id)
@@ -133,21 +135,121 @@ def save_consumption_plan(product_id: str, planned_by_day: dict[date, int]) -> N
         df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
     if df.empty:
         init_consumption_plan_csv()
-    else:
-        store.write_csv(df, CONSUMPTION_PLAN_CSV)
+        return True
+    return store.write_csv(df, CONSUMPTION_PLAN_CSV)
 
 
-def clear_consumption_plan(product_id: str, start_date: date, end_date: date) -> None:
+def clear_consumption_plan(product_id: str, start_date: date, end_date: date) -> bool:
     df = load_consumption_plan_df()
     if df.empty:
-        return
+        return True
     pid = str(product_id)
     mask = (df["product_id"].astype(str) == pid) & (df["plan_date"] >= start_date) & (df["plan_date"] <= end_date)
     df = df[~mask]
     if df.empty:
         init_consumption_plan_csv()
-    else:
-        store.write_csv(df, CONSUMPTION_PLAN_CSV)
+        return True
+    return store.write_csv(df, CONSUMPTION_PLAN_CSV)
+
+
+def init_actual_sales_csv() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not ACTUAL_SALES_CSV.exists() or ACTUAL_SALES_CSV.stat().st_size == 0:
+        store.write_csv(pd.DataFrame(columns=ACTUAL_SALES_COLUMNS), ACTUAL_SALES_CSV)
+
+
+def load_actual_sales_df(product_id: str | None = None) -> pd.DataFrame:
+    if not ACTUAL_SALES_CSV.exists() or ACTUAL_SALES_CSV.stat().st_size == 0:
+        return pd.DataFrame(columns=ACTUAL_SALES_COLUMNS)
+    df = store.read_csv(ACTUAL_SALES_CSV)
+    df["actual_units"] = pd.to_numeric(df["actual_units"], errors="coerce").fillna(0).astype(int)
+    df["sale_date"] = pd.to_datetime(df["sale_date"], errors="coerce").dt.date
+    if product_id:
+        df = df[df["product_id"].astype(str) == str(product_id)]
+    return df
+
+
+def load_manual_actual_sales(
+    product_id: str, start_date: date, end_date: date
+) -> dict[date, int]:
+    df = load_actual_sales_df(product_id)
+    if df.empty:
+        return {}
+    out: dict[date, int] = {}
+    for _, row in df.iterrows():
+        d = row["sale_date"]
+        if d is None or pd.isna(d):
+            continue
+        if isinstance(d, pd.Timestamp):
+            d = d.date()
+        if start_date <= d <= end_date:
+            out[d] = int(row["actual_units"])
+    return out
+
+
+def save_actual_sales(product_id: str, actual_by_day: dict[date, int]) -> bool:
+    """手入力の実売数を保存。"""
+    init_actual_sales_csv()
+    df = load_actual_sales_df()
+    pid = str(product_id)
+    if not df.empty:
+        drop_days = set(actual_by_day.keys())
+        df = df[~((df["product_id"].astype(str) == pid) & (df["sale_date"].isin(drop_days)))]
+    now = datetime.now().isoformat()
+    new_rows: list[dict[str, Any]] = []
+    for day_val, qty in actual_by_day.items():
+        if qty < 0:
+            continue
+        new_rows.append(
+            {
+                "product_id": pid,
+                "sale_date": day_val.isoformat(),
+                "actual_units": int(qty),
+                "updated_at": now,
+            }
+        )
+    if new_rows:
+        df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
+    if df.empty:
+        init_actual_sales_csv()
+        return True
+    return store.write_csv(df, ACTUAL_SALES_CSV)
+
+
+def clear_actual_sales(product_id: str, start_date: date, end_date: date) -> bool:
+    df = load_actual_sales_df()
+    if df.empty:
+        return True
+    pid = str(product_id)
+    mask = (
+        (df["product_id"].astype(str) == pid)
+        & (df["sale_date"] >= start_date)
+        & (df["sale_date"] <= end_date)
+    )
+    df = df[~mask]
+    if df.empty:
+        init_actual_sales_csv()
+        return True
+    return store.write_csv(df, ACTUAL_SALES_CSV)
+
+
+def replace_actual_sales_for_period(
+    product_id: str,
+    start_date: date,
+    end_date: date,
+    actual_by_day: dict[date, int],
+    *,
+    today: date,
+) -> bool:
+    """表示期間のうち今日以前の実売数を置き換え（未入力日は削除）。"""
+    past_end = min(end_date, today)
+    if past_end < start_date:
+        return True
+    ok = clear_actual_sales(product_id, start_date, past_end)
+    filtered = {d: int(v) for d, v in actual_by_day.items() if start_date <= d <= past_end}
+    if filtered:
+        ok = save_actual_sales(product_id, filtered) and ok
+    return ok
 
 
 def init_delivery_plan_csv() -> None:
@@ -185,7 +287,7 @@ def load_manual_delivery_plan(
     return out
 
 
-def save_delivery_plan(product_id: str, delivery_by_day: dict[date, int]) -> None:
+def save_delivery_plan(product_id: str, delivery_by_day: dict[date, int]) -> bool:
     """カレンダーで入力した日別納品数を保存（0は行削除）。"""
     init_delivery_plan_csv()
     df = load_delivery_plan_df()
@@ -210,14 +312,14 @@ def save_delivery_plan(product_id: str, delivery_by_day: dict[date, int]) -> Non
         df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
     if df.empty:
         init_delivery_plan_csv()
-    else:
-        store.write_csv(df, DELIVERY_PLAN_CSV)
+        return True
+    return store.write_csv(df, DELIVERY_PLAN_CSV)
 
 
-def clear_delivery_plan(product_id: str, start_date: date, end_date: date) -> None:
+def clear_delivery_plan(product_id: str, start_date: date, end_date: date) -> bool:
     df = load_delivery_plan_df()
     if df.empty:
-        return
+        return True
     pid = str(product_id)
     plan_dates = df["plan_date"].apply(
         lambda d: d.date() if isinstance(d, pd.Timestamp) else d
@@ -230,8 +332,8 @@ def clear_delivery_plan(product_id: str, start_date: date, end_date: date) -> No
     df = df[~mask]
     if df.empty:
         init_delivery_plan_csv()
-    else:
-        store.write_csv(df, DELIVERY_PLAN_CSV)
+        return True
+    return store.write_csv(df, DELIVERY_PLAN_CSV)
 
 
 def replace_delivery_plan_for_period(
@@ -239,12 +341,13 @@ def replace_delivery_plan_for_period(
     start_date: date,
     end_date: date,
     delivery_by_day: dict[date, int],
-) -> None:
+) -> bool:
     """表示期間の納品数をカレンダー表の内容で置き換え（0は削除）。"""
-    clear_delivery_plan(product_id, start_date, end_date)
+    ok = clear_delivery_plan(product_id, start_date, end_date)
     positive = {d: int(v) for d, v in delivery_by_day.items() if int(v) > 0}
     if positive:
-        save_delivery_plan(product_id, positive)
+        ok = save_delivery_plan(product_id, positive) and ok
+    return ok
 
 
 def get_delivery_weekdays(product_id: str) -> list[int]:
@@ -876,6 +979,47 @@ def apply_planned_consumption(
         out.at[i, "stock_end"] = stock_after
         stock = stock_after
 
+    return _apply_stock_status(out, safety_stock, max_stock)
+
+
+def apply_calendar_inputs(
+    projection: pd.DataFrame,
+    planned_by_day: dict[date, int],
+    actual_by_day: dict[date, int],
+    *,
+    today: date,
+    safety_stock: int,
+    max_stock: int = 0,
+) -> pd.DataFrame:
+    """計画消費・実売数（手入力）を反映して日末在庫を再計算。"""
+    if projection.empty:
+        return projection
+    out = projection.copy()
+    stock = int(out.iloc[0]["stock_start"])
+    for i in range(len(out)):
+        row = out.iloc[i]
+        day_val = row["date"]
+        if isinstance(day_val, pd.Timestamp):
+            day_val = day_val.date()
+        predicted = int(row["predicted_use"])
+        planned = max(0, int(planned_by_day.get(day_val, row.get("planned_use", predicted))))
+        is_manual_planned = day_val in planned_by_day
+        is_actual = False
+        if day_val <= today and day_val in actual_by_day:
+            effective = max(0, int(actual_by_day[day_val]))
+            is_actual = True
+        else:
+            effective = planned
+        inbound = int(row["delivery"])
+        out.at[i, "planned_use"] = planned
+        out.at[i, "actual_use"] = int(actual_by_day[day_val]) if day_val in actual_by_day else pd.NA
+        out.at[i, "effective_use"] = effective
+        out.at[i, "is_manual"] = is_manual_planned
+        out.at[i, "is_actual"] = is_actual
+        out.at[i, "stock_start"] = stock
+        stock_after = stock - effective + inbound
+        out.at[i, "stock_end"] = stock_after
+        stock = stock_after
     return _apply_stock_status(out, safety_stock, max_stock)
 
 

@@ -24,19 +24,24 @@ import streamlit as st
 try:
     from food_stock import (
         add_delivery,
+        apply_calendar_inputs,
         apply_planned_consumption,
         build_inventory_projection,
+        clear_actual_sales,
         clear_consumption_plan,
         days_until_stockout,
         delete_delivery,
         get_delivery_weekdays,
+        init_actual_sales_csv,
         init_consumption_plan_csv,
         init_deliveries_csv,
         init_delivery_plan_csv,
         init_inventory_csv,
         load_deliveries_df,
         load_inventory_df,
+        load_manual_actual_sales,
         load_manual_planned_use,
+        replace_actual_sales_for_period,
         replace_delivery_plan_for_period,
         save_consumption_plan,
         save_delivery_weekdays,
@@ -222,28 +227,40 @@ def inject_css() -> None:
             padding: 1rem 1.2rem; margin-bottom: 1rem; color: #5a4a1a;
         }
         .empty-state-box strong { color: #1a1a2e; }
-        /* 在庫カレンダー: 計画消費・納品数（入力列）を強調 */
+        /* 在庫カレンダー: 実売数・計画消費・納品数（入力列）を強調 */
         [data-testid="stDataEditor"] [aria-colindex="5"],
-        [data-testid="stDataEditor"] [aria-colindex="6"] {
+        [data-testid="stDataEditor"] [aria-colindex="6"],
+        [data-testid="stDataEditor"] [aria-colindex="7"] {
             background-color: #fff9f2 !important;
         }
         [data-testid="stDataEditor"] [aria-colindex="5"][role="columnheader"] {
+            background-color: #e8f8ef !important;
+            font-weight: 700 !important;
+            color: #1e6b3a !important;
+        }
+        [data-testid="stDataEditor"] [aria-colindex="6"][role="columnheader"] {
             background-color: #ffe8ec !important;
             font-weight: 700 !important;
             color: #c0392b !important;
         }
-        [data-testid="stDataEditor"] [aria-colindex="6"][role="columnheader"] {
+        [data-testid="stDataEditor"] [aria-colindex="7"][role="columnheader"] {
             background-color: #e8f4ff !important;
             font-weight: 700 !important;
             color: #1a5276 !important;
         }
         [data-testid="stDataEditor"] [aria-colindex="5"] input {
-            border: 2px solid #e94560 !important;
+            border: 2px solid #27ae60 !important;
             border-radius: 6px !important;
             background-color: #fff !important;
             font-weight: 600 !important;
         }
         [data-testid="stDataEditor"] [aria-colindex="6"] input {
+            border: 2px solid #e94560 !important;
+            border-radius: 6px !important;
+            background-color: #fff !important;
+            font-weight: 600 !important;
+        }
+        [data-testid="stDataEditor"] [aria-colindex="7"] input {
             border: 2px solid #2980b9 !important;
             border-radius: 6px !important;
             background-color: #fff !important;
@@ -342,6 +359,7 @@ def reset_application_data() -> None:
     init_inventory_csv(load_products())
     init_deliveries_csv()
     init_consumption_plan_csv()
+    init_actual_sales_csv()
     if not MAPPINGS_CSV.exists():
         init_empty_mappings_csv()
     store.write_text(VERSION_FILE, str(DATA_VERSION))
@@ -375,6 +393,7 @@ def ensure_data_files() -> None:
     init_inventory_csv(load_products())
     init_deliveries_csv()
     init_consumption_plan_csv()
+    init_actual_sales_csv()
     sync_square_mappings()
 
 
@@ -646,7 +665,7 @@ def purge_meaningless_days() -> int:
     return removed
 
 
-def bulk_import_days(imports: list[DayImport], products_df: pd.DataFrame, overwrite: bool = True) -> tuple[int, int]:
+def bulk_import_days(imports: list[DayImport], products_df: pd.DataFrame, overwrite: bool = True) -> tuple[int, int, bool]:
     """CSV結合結果を daily_sales.csv に保存（日付単位で上書き）。"""
     daily_df = load_daily_sales()
     existing_dates = set(daily_df["date"].dt.date.tolist()) if not daily_df.empty else set()
@@ -689,14 +708,14 @@ def bulk_import_days(imports: list[DayImport], products_df: pd.DataFrame, overwr
             )
 
     if not new_rows:
-        return 0, 0
+        return 0, 0, True
 
     if not daily_df.empty:
         daily_df = daily_df[~daily_df["date"].dt.date.isin(import_dates)]
     merged = pd.concat([daily_df, pd.DataFrame(new_rows)], ignore_index=True)
-    store.write_csv(merged, DAILY_CSV)
+    cloud_ok = store.write_csv(merged, DAILY_CSV)
     clear_data_caches()
-    return created, updated
+    return created, updated, cloud_ok
 
 
 # ---------------------------------------------------------------------------
@@ -1377,12 +1396,27 @@ def render_square_upload_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) 
     )
     import_ready = st.button("データを一括取り込み", type="primary", use_container_width=True)
     if import_ready:
-        created, updated = bulk_import_days(imports, products_df, overwrite=overwrite)
+        created, updated, cloud_ok = bulk_import_days(imports, products_df, overwrite=overwrite)
         if created == 0 and updated == 0:
             st.warning("保存された日がありません。上書きOFFで重複日のみの場合は取り込まれません。")
         else:
             _clear_pending_csv_payload()
-            st.success(f"取り込み完了: 新規 {created} 日 / 上書き {updated} 日")
+            total_days = created + updated
+            if store.is_cloud_enabled() and cloud_ok:
+                store.set_persist_notice(
+                    f"取り込み完了: {total_days} 日分を保存し、クラウドにも同期しました。",
+                    "success",
+                )
+            elif store.is_cloud_enabled():
+                store.set_persist_notice(
+                    f"取り込み完了: {total_days} 日分をこの端末に保存しましたが、クラウド同期に失敗しました。",
+                    "warning",
+                )
+            else:
+                store.set_persist_notice(
+                    f"取り込み完了: {total_days} 日分を保存しました。",
+                    "success",
+                )
             st.rerun()
 
     st.markdown("#### アップロードされたファイル")
@@ -2248,8 +2282,14 @@ def render_mtg_report_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> 
                 )
                 end_date = start_date + timedelta(days=int(inv_horizon) - 1)
                 manual_use = load_manual_planned_use(pid, start_date, end_date)
-                projection = apply_planned_consumption(
-                    projection, manual_use, inv_safety, inv_max
+                actual_use = load_manual_actual_sales(pid, start_date, end_date)
+                projection = apply_calendar_inputs(
+                    projection,
+                    manual_use,
+                    actual_use,
+                    today=start_date,
+                    safety_stock=inv_safety,
+                    max_stock=inv_max,
                 )
                 stockout_in = days_until_stockout(projection)
                 stockout_label = (
@@ -2259,7 +2299,11 @@ def render_mtg_report_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> 
                     "safety_stock": inv_safety,
                     "max_stock": inv_max,
                     "horizon": inv_horizon,
-                    "avg_use": float(projection["planned_use"].mean())
+                    "avg_use": float(
+                        projection["effective_use"].mean()
+                        if "effective_use" in projection.columns
+                        else projection["planned_use"].mean()
+                    )
                     if not projection.empty
                     else 0.0,
                     "min_stock": int(projection["stock_end"].min())
@@ -2362,7 +2406,9 @@ def plot_inventory_vertical_calendar(
     ).tolist()
 
     fig = go.Figure()
-    use_col = "planned_use" if "planned_use" in projection.columns else "predicted_use"
+    use_col = "effective_use" if "effective_use" in projection.columns else (
+        "planned_use" if "planned_use" in projection.columns else "predicted_use"
+    )
     use_vals = projection[use_col].astype(int)
     stock_vals = projection["stock_end"].astype(int)
     fig.add_trace(
@@ -2370,7 +2416,7 @@ def plot_inventory_vertical_calendar(
             y=labels,
             x=use_vals,
             orientation="h",
-            name="計画消費",
+            name="反映消費",
             marker_color=colors,
             text=[f"{int(v)} 個" for v in use_vals],
             textposition="outside",
@@ -2441,38 +2487,64 @@ def _projection_row_date(row: pd.Series) -> date:
 
 
 PLAN_CONSUMPTION_COL = "✏️ 計画消費（入力）"
+ACTUAL_SALES_COL = "✏️ 実売数（入力）"
 DELIVERY_PLAN_COL = "📦 納品数（入力）"
+EFFECTIVE_USE_COL = "反映消費"
+
+
+def _parse_optional_int(val: Any) -> int | None:
+    if val is None:
+        return None
+    if isinstance(val, float) and np.isnan(val):
+        return None
+    text = str(val).strip()
+    if not text or text.lower() in ("nan", "none"):
+        return None
+    try:
+        return max(0, int(float(text)))
+    except (TypeError, ValueError):
+        return None
 
 
 def extract_calendar_plan_from_editor(
     edited_df: pd.DataFrame,
-    pred_by_day: dict[date, int],
-) -> tuple[dict[date, int], dict[date, int]]:
-    """カレンダー表の全行から、保存すべき計画消費・納品数を抽出する。"""
-    manual_use: dict[date, int] = {}
+    *,
+    today: date,
+) -> tuple[dict[date, int], dict[date, int], dict[date, int]]:
+    """カレンダー表から計画消費・実売数・納品数を抽出する。"""
+    planned_use: dict[date, int] = {}
+    actual_sales: dict[date, int] = {}
     delivery_plan: dict[date, int] = {}
     for _, row in edited_df.iterrows():
         day_val = pd.to_datetime(str(row["日付"])).date()
-        planned = int(row[PLAN_CONSUMPTION_COL])
-        predicted = pred_by_day.get(day_val, planned)
-        if planned != predicted:
-            manual_use[day_val] = planned
+        planned_use[day_val] = max(0, int(row[PLAN_CONSUMPTION_COL]))
         delivery_plan[day_val] = max(0, int(row[DELIVERY_PLAN_COL]))
-    return manual_use, delivery_plan
+        if day_val <= today:
+            parsed = _parse_optional_int(row.get(ACTUAL_SALES_COL))
+            if parsed is not None:
+                actual_sales[day_val] = parsed
+    return planned_use, actual_sales, delivery_plan
 
 
 def persist_calendar_plan(
     product_id: str,
     start_date: date,
     end_date: date,
-    manual_use: dict[date, int],
+    planned_use: dict[date, int],
+    actual_sales: dict[date, int],
     delivery_plan: dict[date, int],
-) -> None:
-    """表示中のカレンダー内容をそのまま保存する（納品数0も反映）。"""
-    clear_consumption_plan(product_id, start_date, end_date)
-    if manual_use:
-        save_consumption_plan(product_id, manual_use)
-    replace_delivery_plan_for_period(product_id, start_date, end_date, delivery_plan)
+    *,
+    today: date,
+) -> bool:
+    """表示中のカレンダー内容をそのまま保存する。"""
+    ok = clear_consumption_plan(product_id, start_date, end_date)
+    if planned_use:
+        ok = save_consumption_plan(product_id, planned_use) and ok
+    ok = replace_actual_sales_for_period(
+        product_id, start_date, end_date, actual_sales, today=today
+    ) and ok
+    ok = replace_delivery_plan_for_period(product_id, start_date, end_date, delivery_plan) and ok
+    return ok
 
 
 def calendar_editor_revision_key(product_id: str, horizon: int) -> str:
@@ -2509,8 +2581,11 @@ def build_inventory_calendar_editor_df(
     projection: pd.DataFrame,
     delivery_weekdays: list[int] | None = None,
     max_stock: int = 0,
+    actual_by_day: dict[date, int] | None = None,
+    *,
+    today: date | None = None,
 ) -> pd.DataFrame:
-    """縦型カレンダー（計画消費・納品数列を編集）。"""
+    """縦型カレンダー（実売数・計画消費・納品数列を編集）。"""
     if projection.empty:
         return pd.DataFrame(
             columns=[
@@ -2518,8 +2593,10 @@ def build_inventory_calendar_editor_df(
                 "日付",
                 "曜日",
                 "予測消費",
+                ACTUAL_SALES_COL,
                 PLAN_CONSUMPTION_COL,
                 DELIVERY_PLAN_COL,
+                EFFECTIVE_USE_COL,
                 "入荷",
                 "収納MAX",
                 "日末在庫",
@@ -2530,6 +2607,8 @@ def build_inventory_calendar_editor_df(
     status_label = {"ok": "🟢", "low": "🟡", "out": "🔴", "over": "🟣"}
     max_val = int(max_stock) if int(max_stock) > 0 else COLD_STORAGE_CAPACITY
     wd_set = set(delivery_weekdays or [])
+    actual_map = actual_by_day or {}
+    today_val = today or date.today()
 
     def row_marker(r: pd.Series) -> str:
         if bool(r.get("is_today")):
@@ -2545,19 +2624,30 @@ def build_inventory_calendar_editor_df(
     )
     cal["状態"] = cal.apply(
         lambda r: status_label.get(str(r["status"]), "🟢")
-        + (" ✎" if bool(r.get("is_manual")) else ""),
+        + (" 実" if bool(r.get("is_actual")) else "")
+        + (" ✎" if bool(r.get("is_manual")) and not bool(r.get("is_actual")) else ""),
         axis=1,
     )
     use_col = "planned_use" if "planned_use" in cal.columns else "predicted_use"
+    effective_col = "effective_use" if "effective_use" in cal.columns else use_col
     scheduled = cal["delivery_scheduled"] if "delivery_scheduled" in cal.columns else cal["delivery"]
+    actual_inputs: list[Any] = []
+    for _, row in cal.iterrows():
+        day_val = _projection_row_date(row)
+        if day_val <= today_val and day_val in actual_map:
+            actual_inputs.append(int(actual_map[day_val]))
+        else:
+            actual_inputs.append(np.nan)
     return pd.DataFrame(
         {
             "": cal[""],
             "日付": cal["日付"],
             "曜日": cal["曜日"],
             "予測消費": cal["predicted_use"].astype(int),
+            ACTUAL_SALES_COL: actual_inputs,
             PLAN_CONSUMPTION_COL: cal[use_col].astype(int),
             DELIVERY_PLAN_COL: scheduled.astype(int),
+            EFFECTIVE_USE_COL: cal[effective_col].astype(int),
             "入荷": cal.apply(format_delivery_display, axis=1),
             "収納MAX": max_val,
             "日末在庫": cal["stock_end"].apply(
@@ -2759,6 +2849,7 @@ def _render_inventory_calendar_section(
         return
 
     start_date = date.today()
+    today_val = start_date
     end_date = start_date + timedelta(days=int(horizon) - 1)
     current_stock, safety_stock, max_stock = get_inventory_row_defaults(inv_df, product_id)
 
@@ -2772,19 +2863,26 @@ def _render_inventory_calendar_section(
         safety_stock=int(safety_stock),
         max_stock=int(max_stock),
     )
-    manual_use = load_manual_planned_use(product_id, start_date, end_date)
-    projection = apply_planned_consumption(
-        projection, manual_use, int(safety_stock), int(max_stock)
+    planned_use = load_manual_planned_use(product_id, start_date, end_date)
+    actual_sales = load_manual_actual_sales(product_id, start_date, end_date)
+    projection = apply_calendar_inputs(
+        projection,
+        planned_use,
+        actual_sales,
+        today=today_val,
+        safety_stock=int(safety_stock),
+        max_stock=int(max_stock),
     )
-    pred_by_day = {_projection_row_date(row): int(row["predicted_use"]) for _, row in projection.iterrows()}
 
-    avg_use = float(projection["planned_use"].mean()) if not projection.empty else 0.0
+    avg_use = float(projection["effective_use"].mean()) if "effective_use" in projection.columns else (
+        float(projection["planned_use"].mean()) if not projection.empty else 0.0
+    )
     stockout_in = days_until_stockout(projection)
     min_stock = int(projection["stock_end"].min()) if not projection.empty else 0
 
     m1, m2, m3, m4, m5 = st.columns(5)
     with m1:
-        st.metric("計画の平均消費", f"{avg_use:,.1f} 個/日")
+        st.metric("反映消費の平均", f"{avg_use:,.1f} 個/日")
     with m2:
         st.metric("収納MAX", f"{max_stock:,} 個")
     with m3:
@@ -2798,15 +2896,22 @@ def _render_inventory_calendar_section(
             st.metric("在庫切れ予測", "なし", delta="期間内は維持")
 
     delivery_weekdays = get_delivery_weekdays(product_id)
-    editor_df = build_inventory_calendar_editor_df(projection, delivery_weekdays, max_stock)
+    editor_df = build_inventory_calendar_editor_df(
+        projection,
+        delivery_weekdays,
+        max_stock,
+        actual_sales,
+        today=today_val,
+    )
     editor_key = calendar_editor_widget_key(product_id, int(horizon))
 
     st.markdown("##### 縦型カレンダー")
     st.caption(
-        f"**{PLAN_CONSUMPTION_COL}** と **{DELIVERY_PLAN_COL}** を編集し、"
-        " **「カレンダーを保存して在庫を再計算」** を押すと入力内容が保存されます。"
-        " 納品数を **0** にするとその日の納品は削除されます。"
-        " 入荷列の **（臨時）** は上の「臨時の入荷」で追加した分です。"
+        f"**{ACTUAL_SALES_COL}** は今日以前の実際の販売数（手入力）。"
+        f" **{PLAN_CONSUMPTION_COL}** は今後の見込み消費。"
+        f" **{DELIVERY_PLAN_COL}** は納品数。"
+        " **「カレンダーを保存して在庫を再計算」** で保存されます。"
+        f" **{EFFECTIVE_USE_COL}** は在庫計算に使った消費数です（実売数入力があれば優先）。"
     )
 
     with st.form(
@@ -2817,9 +2922,17 @@ def _render_inventory_calendar_section(
             editor_df,
             key=editor_key,
             column_config={
+                ACTUAL_SALES_COL: st.column_config.NumberColumn(
+                    ACTUAL_SALES_COL,
+                    help="今日以前の実際の販売数。未入力の日は計画消費を在庫計算に使います。",
+                    min_value=0,
+                    max_value=9999,
+                    step=1,
+                    format="%d",
+                ),
                 PLAN_CONSUMPTION_COL: st.column_config.NumberColumn(
                     PLAN_CONSUMPTION_COL,
-                    help="その日に使う個数",
+                    help="その日に使う個数の見込み（主に未来の日）",
                     min_value=0,
                     max_value=9999,
                     step=1,
@@ -2834,13 +2947,13 @@ def _render_inventory_calendar_section(
                     format="%d",
                 ),
             },
-            disabled=["", "日付", "曜日", "予測消費", "入荷", "収納MAX", "日末在庫", "状態"],
+            disabled=["", "日付", "曜日", "予測消費", EFFECTIVE_USE_COL, "入荷", "収納MAX", "日末在庫", "状態"],
             hide_index=True,
             use_container_width=True,
             num_rows="fixed",
         )
 
-        btn_save, btn_reset, btn_reset_del = st.columns(3)
+        btn_save, btn_reset, btn_reset_actual, btn_reset_del = st.columns(4)
         with btn_save:
             save_plan = st.form_submit_button(
                 "カレンダーを保存して在庫を再計算",
@@ -2848,20 +2961,47 @@ def _render_inventory_calendar_section(
             )
         with btn_reset:
             reset_plan = st.form_submit_button("計画消費を予測に戻す")
+        with btn_reset_actual:
+            reset_actual = st.form_submit_button("実売数をクリア")
         with btn_reset_del:
             reset_delivery = st.form_submit_button("納品数をクリア")
 
     if save_plan:
-        manual_use, delivery_plan = extract_calendar_plan_from_editor(edited_df, pred_by_day)
-        persist_calendar_plan(product_id, start_date, end_date, manual_use, delivery_plan)
+        planned_use, actual_sales_input, delivery_plan = extract_calendar_plan_from_editor(
+            edited_df, today=today_val
+        )
+        cloud_ok = persist_calendar_plan(
+            product_id,
+            start_date,
+            end_date,
+            planned_use,
+            actual_sales_input,
+            delivery_plan,
+            today=today_val,
+        )
         bump_calendar_editor_revision(product_id, int(horizon))
-        st.success("カレンダーを保存し、在庫見込みを更新しました。")
+        if store.is_cloud_enabled() and cloud_ok:
+            store.set_persist_notice("カレンダーを保存し、クラウドにも同期しました。", "success")
+        elif store.is_cloud_enabled():
+            store.set_persist_notice(
+                "カレンダーはこの端末に保存しましたが、クラウド同期に失敗しました。",
+                "warning",
+            )
+        else:
+            store.set_persist_notice("カレンダーを保存し、在庫見込みを更新しました。", "success")
         st.rerun()
 
     if reset_plan:
         clear_consumption_plan(product_id, start_date, end_date)
         bump_calendar_editor_revision(product_id, int(horizon))
         st.success("計画消費を予測に戻しました。")
+        st.rerun()
+
+    if reset_actual:
+        past_end = min(end_date, today_val)
+        clear_actual_sales(product_id, start_date, past_end)
+        bump_calendar_editor_revision(product_id, int(horizon))
+        st.success("表示期間の実売数（手入力）をクリアしました。")
         st.rerun()
 
     if reset_delivery:
@@ -2871,7 +3011,7 @@ def _render_inventory_calendar_section(
         st.rerun()
 
     st.caption(
-        "🔴 不足 · 🟡 注意 · 🟣 収納超過 · ✎ 手入力 · 日末在庫は「現在/MAX」表示"
+        "🔴 不足 · 🟡 注意 · 🟣 収納超過 · 実 実売数反映 · ✎ 計画手入力 · 日末在庫は「現在/MAX」表示"
     )
 
     st.markdown("##### 消費と予想在庫")
@@ -2895,6 +3035,7 @@ def render_inventory_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
     init_deliveries_csv()
     init_consumption_plan_csv()
     init_delivery_plan_csv()
+    init_actual_sales_csv()
     product_list = active_products(products_df)
     inv_df = load_inventory_df()
     render_all_products_stock_editor(product_list, inv_df)
@@ -2934,6 +3075,16 @@ def main() -> None:
     if is_daily_data_empty(daily_df):
         show_empty_data_notice()
 
+    if notice := store.pop_persist_notice():
+        level = notice.get("level", "info")
+        message = notice.get("message", "")
+        if level == "success":
+            st.success(message)
+        elif level == "warning":
+            st.warning(message)
+        else:
+            st.info(message)
+
     with st.sidebar:
         st.markdown("### データ管理")
         st.caption(f"登録日数: **{len(list_recorded_dates(daily_df))}** 日")
@@ -2960,7 +3111,7 @@ def main() -> None:
         st.caption(store.cloud_status_label())
         if store.is_cloud_enabled():
             if st.button("クラウドから最新を取得", type="secondary", use_container_width=True):
-                store.ensure_cloud_sync(force=True)
+                store.ensure_cloud_sync(force=True, force_pull=True)
                 clear_data_caches()
                 st.rerun()
             if st.button("この端末のデータをクラウドへ送信", type="secondary", use_container_width=True):

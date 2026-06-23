@@ -4,3 +4,4 @@ __pycache__/
 .streamlit/secrets.toml
 data/inventory.csv
 data/inventory_*.csv
+data/.sync_manifest.json
