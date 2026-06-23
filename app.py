@@ -2023,7 +2023,7 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
                 save_stock = st.form_submit_button("在庫を登録", use_container_width=True)
 
         if save_stock:
-            save_product_inventory(
+            cloud_ok = save_product_inventory(
                 str(product_id),
                 selected_name,
                 int(current_stock),
@@ -2031,7 +2031,19 @@ def render_dashboard_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
                 int(order_default_max),
             )
             reset_inventory_input_widgets(product_id=str(product_id))
-            st.success(f"{selected_name} の在庫を登録しました。")
+            st.session_state["inv_data_rev"] = int(st.session_state.get("inv_data_rev", 0)) + 1
+            if store.is_cloud_enabled() and cloud_ok:
+                store.set_persist_notice(
+                    f"{selected_name} の在庫を保存し、クラウドにも同期しました。",
+                    "success",
+                )
+            elif store.is_cloud_enabled():
+                store.set_persist_notice(
+                    f"{selected_name} の在庫はこの端末に保存しましたが、クラウド同期に失敗しました。",
+                    "warning",
+                )
+            else:
+                store.set_persist_notice(f"{selected_name} の在庫を保存しました。", "success")
             st.rerun()
 
         os_caption = st.columns([1, 3])
@@ -2620,6 +2632,7 @@ def build_inventory_calendar_editor_df(
                 PLAN_CONSUMPTION_COL,
                 DELIVERY_PLAN_COL,
                 EFFECTIVE_USE_COL,
+                "開始在庫",
                 "入荷",
                 "収納MAX",
                 "日末在庫",
@@ -2673,6 +2686,7 @@ def build_inventory_calendar_editor_df(
             PLAN_CONSUMPTION_COL: cal[use_col].astype(int),
             DELIVERY_PLAN_COL: scheduled.astype(int),
             EFFECTIVE_USE_COL: cal[effective_col].astype(int),
+            "開始在庫": cal["stock_start"].astype(int),
             "入荷": cal.apply(format_delivery_display, axis=1),
             "収納MAX": max_val,
             "日末在庫": cal["stock_end"].apply(
@@ -2694,7 +2708,7 @@ def get_inventory_row_defaults(inv_df: pd.DataFrame, product_id: str) -> tuple[i
     return stock, safety, max_stock
 
 
-def render_all_products_stock_editor(product_list: pd.DataFrame, inv_df: pd.DataFrame) -> None:
+def render_all_products_stock_editor(product_list: pd.DataFrame) -> None:
     """全フードの在庫を商品ごとに登録。"""
     st.markdown("##### 全フードの在庫登録")
     st.caption(
@@ -2711,48 +2725,52 @@ def render_all_products_stock_editor(product_list: pd.DataFrame, inv_df: pd.Data
     with h4:
         st.caption("**収納MAX**")
 
+    inv_df = load_inventory_df()
+    stock_rows: list[tuple[str, str, int, int, int]] = []
+    form_rev = stock_form_revision()
+
     with st.form(
-        f"all_products_stock_form_{stock_form_revision()}",
+        f"all_products_stock_form_{form_rev}",
         clear_on_submit=False,
     ):
         for _, prow in product_list.iterrows():
             pid = str(prow["product_id"])
             pname = str(prow["name"])
             d_stock, d_safety, d_max = get_inventory_row_defaults(inv_df, pid)
-            stock_key, safety_key, max_key = stock_input_widget_keys(pid)
             c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
             with c1:
                 st.markdown(f"**{pname}**")
             with c2:
-                st.number_input(
+                stock_val = st.number_input(
                     "在庫",
                     min_value=0,
                     max_value=9999,
                     value=d_stock,
                     step=1,
-                    key=stock_key,
+                    key=f"all_inv_stock_{pid}_{form_rev}",
                     label_visibility="collapsed",
                 )
             with c3:
-                st.number_input(
+                safety_val = st.number_input(
                     "安全在庫",
                     min_value=0,
                     max_value=500,
                     value=d_safety,
                     step=1,
-                    key=safety_key,
+                    key=f"all_inv_safety_{pid}_{form_rev}",
                     label_visibility="collapsed",
                 )
             with c4:
-                st.number_input(
+                max_val = st.number_input(
                     "収納MAX",
                     min_value=1,
                     max_value=9999,
                     value=d_max,
                     step=5,
-                    key=max_key,
+                    key=f"all_inv_max_{pid}_{form_rev}",
                     label_visibility="collapsed",
                 )
+            stock_rows.append((pid, pname, int(stock_val), int(safety_val), int(max_val)))
 
         submitted = st.form_submit_button(
             "全フードの在庫を保存",
@@ -2761,20 +2779,21 @@ def render_all_products_stock_editor(product_list: pd.DataFrame, inv_df: pd.Data
         )
 
     if submitted:
-        rev = stock_form_revision()
-        for _, prow in product_list.iterrows():
-            pid = str(prow["product_id"])
-            pname = str(prow["name"])
-            stock_key, safety_key, max_key = stock_input_widget_keys(pid, rev)
-            save_product_inventory(
-                pid,
-                pname,
-                int(st.session_state[stock_key]),
-                int(st.session_state[safety_key]),
-                int(st.session_state[max_key]),
-            )
+        cloud_ok = True
+        for pid, pname, stock, safety, max_stock in stock_rows:
+            ok = save_product_inventory(pid, pname, stock, safety, max_stock)
+            cloud_ok = cloud_ok and ok
         bump_stock_form_revision()
-        st.success("全フードの在庫を保存しました。")
+        st.session_state["inv_data_rev"] = int(st.session_state.get("inv_data_rev", 0)) + 1
+        if store.is_cloud_enabled() and cloud_ok:
+            store.set_persist_notice("全フードの在庫を保存し、クラウドにも同期しました。", "success")
+        elif store.is_cloud_enabled():
+            store.set_persist_notice(
+                "在庫はこの端末に保存しましたが、クラウド同期に失敗しました。",
+                "warning",
+            )
+        else:
+            store.set_persist_notice("全フードの在庫を保存しました。", "success")
         st.rerun()
 
 
@@ -2784,7 +2803,7 @@ def _render_inventory_calendar_section(
     product_list: pd.DataFrame,
 ) -> None:
     """在庫カレンダー部分のみ再描画し、在庫一覧などの再計算を避ける。"""
-    inv_df = load_inventory_df()
+    _ = st.session_state.get("inv_data_rev", 0)
     st.markdown("##### カレンダー・納品の設定")
     selected_name = st.selectbox(
         "カレンダーを表示するフード商品",
@@ -2794,10 +2813,13 @@ def _render_inventory_calendar_section(
     selected = product_list[product_list["name"] == selected_name].iloc[0]
     product_id = str(selected["product_id"])
 
+    inv_df = load_inventory_df()
     current_stock, safety_stock, max_stock = get_inventory_row_defaults(inv_df, product_id)
     st.caption(
-        f"**{selected_name}** の登録: 在庫 **{current_stock:,}** 個"
-        f" / 安全 **{safety_stock:,}** / 収納MAX **{max_stock:,}** — 変更は上の一覧から保存。"
+        f"**{selected_name}** の登録: **今日の開始在庫 {current_stock:,}** 個"
+        f" / 安全 **{safety_stock:,}** / 収納MAX **{max_stock:,}**"
+        " — 上の一覧で保存した数値が起点です。"
+        " 表の **開始在庫** はその日の朝時点、**日末在庫** は消費・入荷後の終わりの数です。"
     )
 
     st.markdown("##### 納品曜日")
@@ -2832,6 +2854,7 @@ def _render_inventory_calendar_section(
 
     today_val = date.today()
     start_date, end_date = calendar_date_range(today_val)
+    inv_df = load_inventory_df()
     current_stock, safety_stock, max_stock = get_inventory_row_defaults(inv_df, product_id)
 
     projection = build_inventory_calendar_projection(
@@ -2936,7 +2959,7 @@ def _render_inventory_calendar_section(
                     format="%d",
                 ),
             },
-            disabled=["", "日付", "曜日", "予測消費", EFFECTIVE_USE_COL, "入荷", "収納MAX", "日末在庫", "状態"],
+            disabled=["", "日付", "曜日", "予測消費", EFFECTIVE_USE_COL, "開始在庫", "入荷", "収納MAX", "日末在庫", "状態"],
             hide_index=True,
             use_container_width=True,
             num_rows="fixed",
@@ -3027,8 +3050,7 @@ def render_inventory_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> N
     init_delivery_plan_csv()
     init_actual_sales_csv()
     product_list = active_products(products_df)
-    inv_df = load_inventory_df()
-    render_all_products_stock_editor(product_list, inv_df)
+    render_all_products_stock_editor(product_list)
     _render_inventory_calendar_section(daily_df, product_list)
 
 
@@ -3101,6 +3123,7 @@ def main() -> None:
         st.caption(store.cloud_status_label())
         if store.is_cloud_enabled():
             if st.button("クラウドから最新を取得", type="secondary", use_container_width=True):
+                store.clear_session_dirty()
                 store.ensure_cloud_sync(force=True, force_pull=True)
                 clear_data_caches()
                 st.rerun()

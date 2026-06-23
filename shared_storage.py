@@ -194,6 +194,45 @@ def _is_recently_written(rel_path: str) -> bool:
     return time.time() - manifest_ts < _WRITE_PROTECT_SECONDS
 
 
+def mark_session_dirty(rel_path: str) -> None:
+    """このセッションで編集したファイルをクラウドの古いコピーで上書きしない。"""
+    try:
+        import streamlit as st
+
+        dirty = st.session_state.setdefault("_session_dirty_files", set())
+        if not isinstance(dirty, set):
+            dirty = set(dirty)
+            st.session_state["_session_dirty_files"] = dirty
+        dirty.add(rel_path)
+    except Exception:
+        pass
+
+
+def clear_session_dirty(rel_path: str | None = None) -> None:
+    """明示的なクラウド取得前に呼び出す。"""
+    try:
+        import streamlit as st
+
+        if rel_path is None:
+            st.session_state.pop("_session_dirty_files", None)
+            return
+        dirty = st.session_state.get("_session_dirty_files")
+        if isinstance(dirty, set):
+            dirty.discard(rel_path)
+    except Exception:
+        pass
+
+
+def _is_session_dirty(rel_path: str) -> bool:
+    try:
+        import streamlit as st
+
+        dirty = st.session_state.get("_session_dirty_files", set())
+        return rel_path in dirty if isinstance(dirty, set) else False
+    except Exception:
+        return False
+
+
 def _set_persist_notice(message: str, level: str = "info") -> None:
     try:
         import streamlit as st
@@ -279,8 +318,6 @@ def sync_file_bidirectional(rel_path: str, *, force_pull: bool = False) -> SyncA
     local_mtime = _effective_local_mtime(rel_path)
 
     if force_pull:
-        if _is_recently_written(rel_path) and local_path.exists():
-            return "uploaded" if upload_file(rel_path) else "skipped"
         if download_file(rel_path, force=True):
             return "downloaded"
         if local_path.exists():
@@ -289,7 +326,7 @@ def sync_file_bidirectional(rel_path: str, *, force_pull: bool = False) -> SyncA
 
     cloud_mtime = _cloud_file_mtime(rel_path)
 
-    if _is_recently_written(rel_path) and local_path.exists():
+    if (_is_recently_written(rel_path) or _is_session_dirty(rel_path)) and local_path.exists():
         return "uploaded" if upload_file(rel_path) else "skipped"
 
     if cloud_mtime is None:

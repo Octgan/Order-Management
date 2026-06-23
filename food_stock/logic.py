@@ -22,7 +22,7 @@ ACTUAL_SALES_CSV = DATA_DIR / "inventory_actual_sales.csv"
 
 DEFAULT_MAX_STOCK = 300
 CALENDAR_TOTAL_DAYS = 30
-CALENDAR_PAST_DAYS = 14
+CALENDAR_PAST_DAYS = 10
 
 INVENTORY_COLUMNS = [
     "product_id",
@@ -774,9 +774,9 @@ def save_product_inventory(
     current_stock: int,
     safety_stock: int,
     max_stock: int | None = None,
-) -> None:
+) -> bool:
     """在庫数・安全在庫・収納MAXを保存。"""
-    df = load_inventory_df()
+    df = load_inventory_df().copy()
     pid = str(product_id)
     now = datetime.now().isoformat()
     mask = df["product_id"].astype(str) == pid
@@ -812,7 +812,9 @@ def save_product_inventory(
             ],
             ignore_index=True,
         )
-    store.write_csv(df, INVENTORY_CSV)
+    ok = store.write_csv(df, INVENTORY_CSV)
+    store.mark_session_dirty("inventory.csv")
+    return ok
 
 
 def load_deliveries_df(product_id: str | None = None) -> pd.DataFrame:
