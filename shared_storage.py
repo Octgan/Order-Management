@@ -430,6 +430,10 @@ def write_csv(df: pd.DataFrame, path: Path, **kwargs: Any) -> bool:
     return False
 
 
+def read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
 def write_text(path: Path, text: str) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".part")
