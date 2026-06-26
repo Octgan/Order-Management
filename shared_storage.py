@@ -201,15 +201,24 @@ def is_ephemeral_host() -> bool:
     return bool(os.environ.get("STREAMLIT_SHARING_MODE"))
 
 
+def _storage_headers(api_key: str) -> dict[str, str]:
+    """Storage API 用ヘッダー。sb_secret 等の新形式キーは apiKey のみ送る。"""
+    headers = {"apiKey": api_key}
+    if not api_key.startswith("sb_"):
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
 def _get_client() -> tuple[Any, str]:
     global _client, _bucket
     cfg = _get_config()
     if cfg is None:
         raise RuntimeError("Supabase is not configured")
     if _client is None:
-        from supabase import create_client
+        from storage3 import SyncStorageClient
 
-        _client = create_client(cfg["url"], cfg["key"])
+        storage_url = f"{cfg['url'].rstrip('/')}/storage/v1"
+        _client = SyncStorageClient(storage_url, _storage_headers(cfg["key"]))
         _bucket = cfg["bucket"]
     assert _bucket is not None
     return _client, _bucket
@@ -238,7 +247,7 @@ def _cloud_file_mtime(rel_path: str) -> float | None:
     parent = Path(rel_path).parent.as_posix()
     prefix = "" if parent in ("", ".") else parent
     try:
-        items = client.storage.from_(bucket).list(prefix)
+        items = client.from_(bucket).list(prefix)
         for item in items or []:
             if str(item.get("name")) != name:
                 continue
@@ -398,7 +407,7 @@ def download_file(rel_path: str, *, force: bool = False) -> bool:
         if cloud_mtime is not None and cloud_mtime <= local_mtime + _MTIME_TOLERANCE_SECONDS:
             return False
     try:
-        data = client.storage.from_(bucket).download(rel_path)
+        data = client.from_(bucket).download(rel_path)
         local_path.parent.mkdir(parents=True, exist_ok=True)
         local_path.write_bytes(data)
         _flush_path(local_path)
@@ -422,7 +431,7 @@ def upload_file(rel_path: str) -> bool:
     body = local_path.read_bytes()
     content_type = "text/plain" if rel_path.startswith(".") else "text/csv"
     try:
-        client.storage.from_(bucket).upload(
+        client.from_(bucket).upload(
             rel_path,
             body,
             file_options={"content-type": content_type, "upsert": "true"},
@@ -522,16 +531,27 @@ def ensure_cloud_sync(
     return 0
 
 
+def _format_cloud_error(exc: Exception) -> str:
+    text = str(exc)
+    if "Invalid Compact JWS" in text or "Invalid JWT" in text:
+        return (
+            "APIキーの形式が合っていません。"
+            " `sb_secret_...` を使っている場合はアプリを最新版に更新してください。"
+            " または Supabase の **Legacy service_role** キー（`eyJ...` で始まる）を Secrets の key に設定してください。"
+        )
+    return text[:240]
+
+
 def probe_cloud_connection() -> tuple[bool, str]:
     """Supabase Storage へ接続できるか確認する（秘密情報は返さない）。"""
     if not is_cloud_enabled():
         return False, "Supabase 設定が未完了です"
     try:
         client, bucket = _get_client()
-        client.storage.from_(bucket).list("", {"limit": 1})
+        client.from_(bucket).list("", {"limit": 1})
         return True, ""
     except Exception as exc:
-        return False, str(exc)[:240]
+        return False, _format_cloud_error(exc)
 
 
 def cloud_status_label() -> str:

@@ -3210,7 +3210,8 @@ bucket = "order-app-data"
 「すべてのデータを保存」ボタンが出ます。
 
 **Supabase 側:** Storage に `order-app-data` バケットを作成してください。  
-**キー:** Project Settings → API の **service_role**（`sb_secret_...` または `eyJ...`）
+**キー:** Project Settings → API の **Secret key**（`sb_secret_...`）  
+または **Legacy service_role**（`eyJ...` で始まる JWT）でも可
 
 **注意:** GitHub の Secrets ではなく、**Streamlit Cloud の Secrets** に貼ってください。
                     """
