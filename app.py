@@ -1325,6 +1325,7 @@ def render_square_upload_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) 
         "2枚のCSVを同時にアップロードしてください。"
         " ①商品別マトリックス、または期間の「商品売上サマリー」"
         " ②売上サマリー（客数・店舗純売上＝税抜で取り込み）"
+        " — プレビュー後 **「データを一括取り込み」** を押すと保存されます。"
     )
 
     uploaded_list = st.file_uploader(
@@ -2551,6 +2552,7 @@ def persist_calendar_plan(
     today: date,
 ) -> bool:
     """表示中のカレンダー内容をそのまま保存する。"""
+    store.mark_calendar_data_dirty()
     ok = clear_consumption_plan(product_id, start_date, end_date)
     if planned_use:
         ok = save_consumption_plan(product_id, planned_use) and ok
@@ -2558,6 +2560,7 @@ def persist_calendar_plan(
         product_id, start_date, end_date, actual_sales, today=today
     ) and ok
     ok = replace_delivery_plan_for_period(product_id, start_date, end_date, delivery_plan) and ok
+    store.mark_calendar_data_dirty()
     return ok
 
 
@@ -2920,7 +2923,7 @@ def _render_inventory_calendar_section(
         f" **{ACTUAL_SALES_COL}** は今日以前の実際の販売数（手入力）。"
         f" **{PLAN_CONSUMPTION_COL}** は見込み消費。"
         f" **{DELIVERY_PLAN_COL}** は納品数。"
-        " **「カレンダーを保存して在庫を再計算」** で保存されます。"
+        " 入力後は必ず **「カレンダーを保存して在庫を再計算」** を押してください（保存しないと消えます）。"
         f" **{EFFECTIVE_USE_COL}** は在庫計算に使った消費数です（実売数入力があれば優先）。"
     )
 
@@ -3035,6 +3038,11 @@ def _render_inventory_calendar_section(
 
 def render_inventory_tab(products_df: pd.DataFrame, daily_df: pd.DataFrame) -> None:
     st.markdown('<p class="section-title">在庫管理</p>', unsafe_allow_html=True)
+    st.info(
+        "**在庫** →「全フードの在庫を保存」、**カレンダー** →「カレンダーを保存して在庫を再計算」"
+        " でそれぞれ保存してください。"
+        " サイドバーの **「すべてのデータを保存」** でクラウドにも送れます。"
+    )
     st.caption(
         "対象は **販売中のフード商品** です（サイドバー「商品・紐づけ設定」で追加した新商品も自動で表示されます）。"
         " **納品曜日** で曜日を登録し、**納品数** は下のカレンダー表に直接入力します。"
@@ -3058,11 +3066,17 @@ def main() -> None:
 
     if store.is_cloud_enabled():
         first_sync = not st.session_state.get("_cloud_initial_sync")
-        synced = store.ensure_cloud_sync(force=first_sync)
         if first_sync:
+            if store.is_local_data_empty():
+                store.ensure_cloud_sync(force=True, force_pull=True)
+            else:
+                store.push_all_to_cloud()
             st.session_state["_cloud_initial_sync"] = True
-        if first_sync or synced > 0:
             clear_data_caches()
+        else:
+            synced = store.ensure_cloud_sync()
+            if synced > 0:
+                clear_data_caches()
 
     if not st.session_state.get("_data_files_initialized"):
         ensure_data_files()
@@ -3120,6 +3134,25 @@ def main() -> None:
         st.markdown("### データ同期")
         st.caption(store.cloud_status_label())
         if store.is_cloud_enabled():
+            st.caption(
+                "データは端末に保存されたまま維持されます。"
+                " 通常の同期では古いクラウドデータで上書きしません。"
+            )
+            ok_conn, conn_err = store.probe_cloud_connection()
+            if not ok_conn:
+                st.error(f"クラウド接続エラー: {conn_err}")
+            if st.button("すべてのデータを保存", type="primary", use_container_width=True):
+                uploaded, upload_errors = store.push_all_to_cloud()
+                if upload_errors:
+                    st.warning("一部のファイルを送信できませんでした。")
+                    for msg in upload_errors[:3]:
+                        st.caption(msg)
+                else:
+                    store.set_persist_notice(
+                        f"すべてのデータ（{uploaded} 件）をクラウドに保存しました。",
+                        "success",
+                    )
+                    st.rerun()
             if st.button("クラウドから最新を取得", type="secondary", use_container_width=True):
                 store.clear_session_dirty()
                 store.ensure_cloud_sync(force=True, force_pull=True)
@@ -3134,10 +3167,58 @@ def main() -> None:
                 else:
                     st.success(f"クラウドへ {uploaded} 件のデータを送信しました。")
         else:
+            setup = store.get_cloud_setup_status()
+            if store.is_ephemeral_host():
+                st.warning("クラウド未接続 — データが消える原因はここです")
             st.caption(
-                "複数端末で共有するには Supabase を設定してください。"
-                "（`.streamlit/secrets.toml.example` を参照）"
+                f"診断: supabaseセクション={'あり' if setup['has_section'] else 'なし'}"
+                f" / url={'OK' if setup['has_url'] else 'なし'}"
+                f" / key={'OK' if setup['has_key'] else 'なし'}"
+                + (f"（{setup['key_length']}文字）" if setup.get("key_length") else "")
             )
+            if setup.get("error_hint"):
+                st.caption(str(setup["error_hint"]))
+            if setup["has_section"] and not setup["has_key"]:
+                st.error("Secrets に [supabase] はありますが **key** が読めません。")
+            elif setup["has_section"] and not setup["has_url"]:
+                st.error("Secrets に [supabase] はありますが **url** が読めません。")
+            elif not setup["has_section"]:
+                st.error("Secrets に **[supabase]** セクションがまだありません。")
+            with st.expander(
+                "Supabase 設定手順（Streamlit Cloud）",
+                expanded=store.is_ephemeral_host(),
+            ):
+                st.markdown(
+                    """
+1. ブラウザで **[share.streamlit.io](https://share.streamlit.io)** を開く  
+2. このアプリのカード右上 **︙** → **Settings**  
+3. 左メニュー **Secrets** をクリック  
+4. 下の3行を**そのまま**貼り付け（`url` / `key` は自分の値に）  
+
+```toml
+[supabase]
+url = "https://xxxx.supabase.co"
+key = "sb_secret_..."
+bucket = "order-app-data"
+```
+
+5. **Save** を押す  
+6. 右上 **︙** → **Reboot app**（再起動）  
+7. このページを **再読み込み（F5）**
+
+**成功すると** 上に「ローカル優先・クラウド同期 ON」と  
+「すべてのデータを保存」ボタンが出ます。
+
+**Supabase 側:** Storage に `order-app-data` バケットを作成してください。  
+**キー:** Project Settings → API の **service_role**（`sb_secret_...` または `eyJ...`）
+
+**注意:** GitHub の Secrets ではなく、**Streamlit Cloud の Secrets** に貼ってください。
+                    """
+                )
+            if not store.is_ephemeral_host():
+                st.caption(
+                    "ローカル実行時は `.streamlit/secrets.toml` に同じ内容を書いてください。"
+                )
 
         st.divider()
         st.markdown("### 設定・修正")

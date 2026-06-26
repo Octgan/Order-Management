@@ -813,7 +813,6 @@ def save_product_inventory(
             ignore_index=True,
         )
     ok = store.write_csv(df, INVENTORY_CSV)
-    store.mark_session_dirty("inventory.csv")
     return ok
 
 

@@ -23,18 +23,44 @@ SYNCED_FILES = [
     "inventory_delivery_plan.csv",
     "inventory_actual_sales.csv",
     ".data_version",
+    ".sync_manifest.json",
+]
+
+CALENDAR_SYNC_FILES = [
+    "inventory_consumption_plan.csv",
+    "inventory_delivery_plan.csv",
+    "inventory_actual_sales.csv",
 ]
 
 SyncAction = Literal["downloaded", "uploaded", "skipped", "missing"]
 
 _client: Any = None
 _bucket: str | None = None
-_enabled: bool | None = None
 _last_sync_errors: list[str] = []
 _last_upload_errors: list[str] = []
 _last_sync_at: float = 0.0
 _MTIME_TOLERANCE_SECONDS = 2.0
-_WRITE_PROTECT_SECONDS = 180.0
+
+
+def is_local_data_empty() -> bool:
+    """ローカルに実データが1件もない（初回起動など）。"""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    for rel in SYNCED_FILES:
+        if rel == ".sync_manifest.json":
+            continue
+        path = DATA_DIR / rel
+        if path.exists() and path.stat().st_size > 0:
+            return False
+    return True
+
+
+def _record_synced_state(rel_path: str) -> None:
+    """クラウドとローカルが一致した状態を記録。"""
+    manifest = _read_sync_manifest()
+    now = time.time()
+    manifest[rel_path] = now
+    manifest[f"{rel_path}::cloud"] = now
+    _write_sync_manifest(manifest)
 
 
 def _rel_path(path: Path) -> str:
@@ -44,18 +70,73 @@ def _rel_path(path: Path) -> str:
         return path.name
 
 
-def _get_config() -> dict[str, str] | None:
-    url = key = bucket = None
+_last_config_error: str = ""
+
+
+def _read_secret_value(section: Any, *keys: str) -> str | None:
+    """Streamlit Secrets（AttrDict）から値を読む。"""
+    if section is None:
+        return None
+    for key in keys:
+        raw: Any = None
+        try:
+            if hasattr(section, "get"):
+                raw = section.get(key)
+            if raw in (None, "") and hasattr(section, key):
+                raw = getattr(section, key)
+            if raw in (None, "") and hasattr(section, "__getitem__"):
+                raw = section[key]
+        except Exception:
+            raw = None
+        text = str(raw or "").strip()
+        if text:
+            return text
+    return None
+
+
+def _load_supabase_section() -> Any | None:
+    global _last_config_error
     try:
         import streamlit as st
 
-        cfg = st.secrets.get("supabase", {})
-        if isinstance(cfg, dict):
-            url = str(cfg.get("url", "") or "").strip() or None
-            key = str(cfg.get("key", "") or "").strip() or None
-            bucket = str(cfg.get("bucket", "") or "").strip() or None
-    except Exception:
-        pass
+        secrets = st.secrets
+        if "supabase" in secrets:
+            return secrets["supabase"]
+        _last_config_error = "st.secrets に [supabase] セクションがありません"
+    except Exception as exc:
+        _last_config_error = f"Secrets 読み込みエラー: {exc}"
+    return None
+
+
+def _get_config() -> dict[str, str] | None:
+    url = key = bucket = None
+    section = _load_supabase_section()
+    if section is not None:
+        url = _read_secret_value(section, "url", "SUPABASE_URL")
+        key = _read_secret_value(
+            section,
+            "key",
+            "service_role_key",
+            "service_role",
+            "SUPABASE_KEY",
+        )
+        bucket = _read_secret_value(section, "bucket", "SUPABASE_BUCKET")
+
+    if not url or not key:
+        try:
+            import streamlit as st
+
+            root = st.secrets
+            url = url or _read_secret_value(root, "SUPABASE_URL", "supabase_url")
+            key = key or _read_secret_value(
+                root,
+                "SUPABASE_KEY",
+                "supabase_key",
+                "SUPABASE_SERVICE_ROLE_KEY",
+            )
+            bucket = bucket or _read_secret_value(root, "SUPABASE_BUCKET", "supabase_bucket")
+        except Exception:
+            pass
 
     if not url:
         url = os.environ.get("SUPABASE_URL", "").strip() or None
@@ -74,10 +155,43 @@ def _get_config() -> dict[str, str] | None:
 
 
 def is_cloud_enabled() -> bool:
-    global _enabled
-    if _enabled is None:
-        _enabled = _get_config() is not None
-    return _enabled
+    return _get_config() is not None
+
+
+def get_cloud_setup_status() -> dict[str, Any]:
+    """Secrets の設定状況（値そのものは返さない）。"""
+    has_section = has_url = has_key = False
+    key_length = 0
+    section = _load_supabase_section()
+    if section is not None:
+        has_section = True
+        url_val = _read_secret_value(section, "url", "SUPABASE_URL")
+        key_val = _read_secret_value(
+            section,
+            "key",
+            "service_role_key",
+            "service_role",
+            "SUPABASE_KEY",
+        )
+        has_url = bool(url_val)
+        has_key = bool(key_val)
+        if key_val:
+            key_length = len(key_val)
+    if not has_url:
+        has_url = bool(os.environ.get("SUPABASE_URL", "").strip())
+    if not has_key:
+        env_key = os.environ.get("SUPABASE_KEY", "").strip()
+        has_key = bool(env_key)
+        if env_key:
+            key_length = len(env_key)
+    return {
+        "has_section": has_section,
+        "has_url": has_url,
+        "has_key": has_key,
+        "key_length": key_length,
+        "configured": has_url and has_key,
+        "error_hint": _last_config_error,
+    }
 
 
 def is_ephemeral_host() -> bool:
@@ -163,11 +277,33 @@ def _write_sync_manifest(manifest: dict[str, float]) -> None:
     )
 
 
+def _record_cloud_upload(rel_path: str) -> None:
+    """クラウドへ送信済みの時刻を記録（未送信のローカル保存を古いクラウドで上書きしない）。"""
+    manifest = _read_sync_manifest()
+    manifest[f"{rel_path}::cloud"] = time.time()
+    _write_sync_manifest(manifest)
+
+
+def _has_pending_cloud_upload(rel_path: str) -> bool:
+    manifest = _read_sync_manifest()
+    local_ts = float(manifest.get(rel_path, 0.0))
+    cloud_ts = float(manifest.get(f"{rel_path}::cloud", 0.0))
+    return local_ts > cloud_ts + 0.001
+
+
+def mark_calendar_data_dirty() -> None:
+    """カレンダー入力 CSV をこのセッション中はクラウドで上書きしない。"""
+    for rel in CALENDAR_SYNC_FILES:
+        mark_session_dirty(rel)
+
+
 def _record_local_write(rel_path: str) -> None:
     """ローカル保存時刻を記録（OneDrive 等で mtime がずれても新しい方を優先）。"""
     manifest = _read_sync_manifest()
     manifest[rel_path] = time.time()
     _write_sync_manifest(manifest)
+    if rel_path in SYNCED_FILES:
+        mark_session_dirty(rel_path)
     try:
         import streamlit as st
 
@@ -179,19 +315,6 @@ def _record_local_write(rel_path: str) -> None:
 
 def _effective_local_mtime(rel_path: str) -> float:
     return max(_local_file_mtime(rel_path), _read_sync_manifest().get(rel_path, 0.0))
-
-
-def _is_recently_written(rel_path: str) -> bool:
-    try:
-        import streamlit as st
-
-        recent_ts = float(st.session_state.get("_recent_local_writes", {}).get(rel_path, 0.0))
-        if time.time() - recent_ts < _WRITE_PROTECT_SECONDS:
-            return True
-    except Exception:
-        pass
-    manifest_ts = _read_sync_manifest().get(rel_path, 0.0)
-    return time.time() - manifest_ts < _WRITE_PROTECT_SECONDS
 
 
 def mark_session_dirty(rel_path: str) -> None:
@@ -279,6 +402,7 @@ def download_file(rel_path: str, *, force: bool = False) -> bool:
         local_path.parent.mkdir(parents=True, exist_ok=True)
         local_path.write_bytes(data)
         _flush_path(local_path)
+        _record_synced_state(rel_path)
         return True
     except Exception as exc:
         if _is_not_found_error(exc):
@@ -303,6 +427,7 @@ def upload_file(rel_path: str) -> bool:
             body,
             file_options={"content-type": content_type, "upsert": "true"},
         )
+        _record_cloud_upload(rel_path)
         return True
     except Exception as exc:
         _last_upload_errors.append(f"{rel_path}: {exc}")
@@ -310,12 +435,11 @@ def upload_file(rel_path: str) -> bool:
 
 
 def sync_file_bidirectional(rel_path: str, *, force_pull: bool = False) -> SyncAction:
-    """ローカルとクラウドを更新日時で突き合わせ、新しい方を優先して同期。"""
+    """クラウド同期。通常時はローカルを消さずクラウドへ送るだけ（ローカル優先）。"""
     if not is_cloud_enabled():
         return "skipped"
 
     local_path = DATA_DIR / rel_path
-    local_mtime = _effective_local_mtime(rel_path)
 
     if force_pull:
         if download_file(rel_path, force=True):
@@ -324,24 +448,10 @@ def sync_file_bidirectional(rel_path: str, *, force_pull: bool = False) -> SyncA
             return "uploaded" if upload_file(rel_path) else "skipped"
         return "missing"
 
-    cloud_mtime = _cloud_file_mtime(rel_path)
-
-    if (_is_recently_written(rel_path) or _is_session_dirty(rel_path)) and local_path.exists():
+    if local_path.exists() and local_path.stat().st_size > 0:
         return "uploaded" if upload_file(rel_path) else "skipped"
 
-    if cloud_mtime is None:
-        if local_path.exists():
-            return "uploaded" if upload_file(rel_path) else "skipped"
-        return "missing"
-
-    if not local_path.exists():
-        return "downloaded" if download_file(rel_path, force=True) else "missing"
-
-    if cloud_mtime > local_mtime + _MTIME_TOLERANCE_SECONDS:
-        return "downloaded" if download_file(rel_path, force=True) else "skipped"
-    if local_mtime > cloud_mtime + _MTIME_TOLERANCE_SECONDS:
-        return "uploaded" if upload_file(rel_path) else "skipped"
-    return "skipped"
+    return "downloaded" if download_file(rel_path, force=True) else "missing"
 
 
 def sync_all_from_cloud(*, force_pull: bool = False) -> tuple[int, list[str]]:
@@ -412,14 +522,29 @@ def ensure_cloud_sync(
     return 0
 
 
+def probe_cloud_connection() -> tuple[bool, str]:
+    """Supabase Storage へ接続できるか確認する（秘密情報は返さない）。"""
+    if not is_cloud_enabled():
+        return False, "Supabase 設定が未完了です"
+    try:
+        client, bucket = _get_client()
+        client.storage.from_(bucket).list("", {"limit": 1})
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)[:240]
+
+
 def cloud_status_label() -> str:
     if not is_cloud_enabled():
         if is_ephemeral_host():
             return "一時保存（再起動で消えます）"
         return "ローカル保存（この端末のみ）"
+    pending = sum(1 for rel in SYNCED_FILES if _has_pending_cloud_upload(rel))
     if _last_sync_errors or _last_upload_errors:
         return f"クラウド同期（警告 {len(_last_sync_errors) + len(_last_upload_errors)} 件）"
-    return "クラウド同期 ON"
+    if pending:
+        return f"ローカル保存済み（クラウド送信待ち {pending} 件）"
+    return "ローカル優先・クラウド同期 ON"
 
 
 def last_upload_errors() -> list[str]:
